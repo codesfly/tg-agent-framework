@@ -14,7 +14,7 @@ from typing import Any, Sequence
 
 from langgraph.checkpoint.memory import InMemorySaver
 
-from tg_agent_framework.memory.runtime_store import RuntimeStateStore
+from tg_agent_framework.memory.runtime_backend import RuntimeStateBackend
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +58,7 @@ def _decode_hook(obj: dict) -> Any:
 class PersistentMemorySaver(InMemorySaver):
     """在 InMemorySaver 基础上，定期把状态快照写入本地 sqlite（使用 JSON 序列化）。"""
 
-    def __init__(self, state_store: RuntimeStateStore):
+    def __init__(self, state_store: RuntimeStateBackend):
         super().__init__()
         self._state_store = state_store
         self._persist_lock = threading.Lock()

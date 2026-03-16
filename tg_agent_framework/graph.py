@@ -20,7 +20,7 @@ from pydantic import SecretStr
 
 from tg_agent_framework.config import BaseConfig
 from tg_agent_framework.memory.checkpointer import PersistentMemorySaver
-from tg_agent_framework.memory.runtime_store import RuntimeStateStore
+from tg_agent_framework.memory.runtime_backend import RuntimeStateBackend
 from tg_agent_framework.registry import ToolRegistry, tool_registry
 from tg_agent_framework.state import AgentState
 
@@ -61,7 +61,7 @@ def build_trim_messages_delta(
 
 def build_graph(
     config: BaseConfig,
-    state_store: RuntimeStateStore,
+    state_store: RuntimeStateBackend,
     system_prompt: str,
     registry: ToolRegistry | None = None,
     *,

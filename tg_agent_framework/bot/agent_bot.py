@@ -43,6 +43,7 @@ from tg_agent_framework.config import BaseConfig, persist_llm_settings
 from tg_agent_framework.events import EventBus, Events
 from tg_agent_framework.memory.base import BaseMemory
 from tg_agent_framework.memory.null import NullMemory
+from tg_agent_framework.memory.runtime_backend import RuntimeStateBackend
 from tg_agent_framework.memory.runtime_store import (
     FOREGROUND_STATUS_AWAITING_APPROVAL,
     FOREGROUND_STATUS_CANCELLING,
@@ -50,7 +51,6 @@ from tg_agent_framework.memory.runtime_store import (
     FOREGROUND_STATUS_RUNNING,
     FOREGROUND_STATUS_TIMED_OUT,
     PersistedForegroundOperation,
-    RuntimeStateStore,
 )
 
 logger = logging.getLogger(__name__)
@@ -113,12 +113,12 @@ class AgentBot:
         self,
         config: BaseConfig,
         graph: Any,
-        state_store: RuntimeStateStore,
+        state_store: RuntimeStateBackend,
         *,
         memory: BaseMemory | None = None,
         event_bus: EventBus | None = None,
         dangerous_tool_names: set[str] | None = None,
-        graph_factory: Callable[[BaseConfig, RuntimeStateStore], Any] | None = None,
+        graph_factory: Callable[[BaseConfig, RuntimeStateBackend], Any] | None = None,
     ):
         self._config = config
         self._graph = graph

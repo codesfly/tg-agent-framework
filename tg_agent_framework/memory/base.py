@@ -9,6 +9,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
+from tg_agent_framework.memory.types import MemoryRecord, MemoryScope
+
 
 class BaseMemory(ABC):
     """Agent 记忆抽象基类"""
@@ -30,6 +32,28 @@ class BaseMemory(ABC):
     async def get_recent_events(self, limit: int = 20) -> list[dict[str, Any]]:
         """获取最近的事件记录"""
         ...
+
+    async def upsert_memory(self, record: MemoryRecord) -> str:
+        """写入或更新一条长期记忆。默认不支持。"""
+        raise NotImplementedError("当前记忆后端不支持 upsert_memory")
+
+    async def list_memories(
+        self,
+        scope: MemoryScope,
+        *,
+        kind: str | None = None,
+        limit: int = 20,
+    ) -> list[MemoryRecord]:
+        """列出某个 scope 下的长期记忆。默认不支持。"""
+        raise NotImplementedError("当前记忆后端不支持 list_memories")
+
+    async def delete_memory(self, memory_id: str) -> bool:
+        """删除一条长期记忆。默认不支持。"""
+        raise NotImplementedError("当前记忆后端不支持 delete_memory")
+
+    async def summarize_scope(self, scope: MemoryScope) -> str | None:
+        """返回 scope 的最新摘要。默认不支持。"""
+        raise NotImplementedError("当前记忆后端不支持 summarize_scope")
 
     async def cleanup_old_events(self, days: int = 90) -> int:
         """

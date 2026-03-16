@@ -11,3 +11,7 @@ def test_package_and_cli_entrypoint_import():
 
     assert module.__name__ == "tg_agent_framework"
     assert callable(cli_module.main)
+    assert hasattr(module, "MemoryScope")
+    assert hasattr(module, "MemoryRecord")
+    assert hasattr(module, "RuntimeStateBackend")
+    assert hasattr(module, "SqliteLongTermMemory")

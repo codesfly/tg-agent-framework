@@ -161,6 +161,7 @@ from aiogram.types import BotCommand
 from tg_agent_framework import (
     AgentBot,
     QuickAction,
+    SqliteLongTermMemory,
     RuntimeStateStore,
     build_graph,
     tool_registry,
@@ -217,6 +218,8 @@ async def main():
 
     state_store = RuntimeStateStore.from_config(config)
     state_store.init_schema()
+    memory = SqliteLongTermMemory.from_config(config)
+    await memory.init_schema()
 
     def graph_factory(current_config: AgentConfig, current_state_store: RuntimeStateStore):
         return build_graph(
@@ -231,6 +234,7 @@ async def main():
         config=config,
         graph=graph,
         state_store=state_store,
+        memory=memory,
         dangerous_tool_names=tool_registry.dangerous_tool_names,
         graph_factory=graph_factory,
     )

@@ -20,7 +20,10 @@ from tg_agent_framework.graph import build_graph
 from tg_agent_framework.memory.base import BaseMemory
 from tg_agent_framework.memory.checkpointer import PersistentMemorySaver
 from tg_agent_framework.memory.null import NullMemory
+from tg_agent_framework.memory.runtime_backend import RuntimeStateBackend
 from tg_agent_framework.memory.runtime_store import RuntimeStateStore
+from tg_agent_framework.memory.sqlite_memory import SqliteLongTermMemory
+from tg_agent_framework.memory.types import MemoryRecord, MemoryScope
 from tg_agent_framework.registry import ToolCategory, ToolRegistry, tool_registry
 from tg_agent_framework.scheduler import BaseScheduler
 from tg_agent_framework.state import AgentState
@@ -49,6 +52,10 @@ __all__ = [
     "BaseMemory",
     "NullMemory",
     "PersistentMemorySaver",
+    "MemoryRecord",
+    "MemoryScope",
+    "SqliteLongTermMemory",
+    "RuntimeStateBackend",
     "RuntimeStateStore",
     # Bot
     "AgentBot",

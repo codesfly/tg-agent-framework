@@ -28,6 +28,7 @@ python main.py
 | 📱 Telegram Bot | 消息处理、进度追踪、Markdown→HTML、权限校验 |
 | ⚠️ 操作确认 | 危险工具自动暂停，等用户 Telegram 确认后执行 |
 | 💾 状态持久化 | SQLite 存储会话与前台操作状态，重启不丢失 |
+| 🧠 长期记忆 | 可选 SQLite 长期记忆，支持 user/thread/global scope |
 | 🔧 声明式注册 | `@tool_registry.register()` 一行注册工具 |
 | 📡 事件总线 | `EventBus` 发布/订阅，解耦框架与业务 |
 | ⏰ 定时调度 | `BaseScheduler` 注册式健康检查 |
@@ -75,6 +76,8 @@ async def main():
     config = load_base_config(MyConfig)
     store = RuntimeStateStore.from_config(config)
     store.init_schema()
+    memory = SqliteLongTermMemory.from_config(config)
+    await memory.init_schema()
 
     def graph_factory(current_config: MyConfig, current_state_store: RuntimeStateStore):
         return build_graph(
@@ -88,6 +91,7 @@ async def main():
         config=config,
         graph=graph,
         state_store=store,
+        memory=memory,
         graph_factory=graph_factory,
     )
     await bot.run()
@@ -138,6 +142,9 @@ tg_agent_framework/
 ├── memory/
 │   ├── base.py         # BaseMemory ABC
 │   ├── null.py         # NullMemory 空实现
+│   ├── sqlite_memory.py # SqliteLongTermMemory
+│   ├── types.py        # MemoryScope / MemoryRecord
+│   ├── runtime_backend.py # RuntimeStateBackend
 │   ├── checkpointer.py # PersistentMemorySaver
 │   └── runtime_store.py # RuntimeStateStore (SQLite)
 ├── tools/

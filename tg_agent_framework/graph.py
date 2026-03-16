@@ -8,18 +8,55 @@ LangGraph 主状态图 — 通用化编排
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import AnyMessage, SystemMessage
+from langchain_core.messages.modifier import RemoveMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
+from pydantic import SecretStr
 
 from tg_agent_framework.config import BaseConfig
 from tg_agent_framework.memory.checkpointer import PersistentMemorySaver
 from tg_agent_framework.memory.runtime_store import RuntimeStateStore
 from tg_agent_framework.registry import ToolRegistry, tool_registry
 from tg_agent_framework.state import AgentState
+
+
+def trim_messages_for_prompt(
+    messages: Sequence[AnyMessage],
+    *,
+    max_history_messages: int,
+) -> list[AnyMessage]:
+    if max_history_messages <= 0:
+        return [message for message in messages if isinstance(message, SystemMessage)]
+    system_messages = [message for message in messages if isinstance(message, SystemMessage)]
+    history_messages = [message for message in messages if not isinstance(message, SystemMessage)]
+    if len(history_messages) <= max_history_messages:
+        return list(messages)
+    return system_messages + history_messages[-max_history_messages:]
+
+
+def build_trim_messages_delta(
+    messages: Sequence[AnyMessage],
+    *,
+    max_history_messages: int,
+) -> list[RemoveMessage]:
+    if max_history_messages <= 0:
+        removable = [message for message in messages if not isinstance(message, SystemMessage)]
+    else:
+        history_messages = [
+            message for message in messages if not isinstance(message, SystemMessage)
+        ]
+        removable = history_messages[:-max_history_messages]
+    delta: list[RemoveMessage] = []
+    for message in removable:
+        message_id = getattr(message, "id", None)
+        if isinstance(message_id, str):
+            delta.append(RemoveMessage(id=message_id))
+    return delta
 
 
 def build_graph(
@@ -56,10 +93,10 @@ def build_graph(
     if config.llm_reasoning_effort:
         model_kwargs["reasoning_effort"] = config.llm_reasoning_effort
 
-    llm = ChatOpenAI(
-        api_key=config.llm_api_key,
-        base_url=config.llm_base_url,
-        model=config.llm_model,
+    llm = ChatOpenAI(  # type: ignore[call-arg]
+        openai_api_key=SecretStr(config.llm_api_key) if config.llm_api_key else None,
+        openai_api_base=config.llm_base_url,
+        model_name=config.llm_model,
         temperature=0,
         request_timeout=config.llm_request_timeout_seconds,
         model_kwargs=model_kwargs,
@@ -72,10 +109,18 @@ def build_graph(
     async def agent_node(state: dict) -> dict:
         """LLM 推理节点"""
         messages = state["messages"]
-        if not messages or not isinstance(messages[0], SystemMessage):
-            messages = [SystemMessage(content=system_prompt)] + messages
-        response = await llm_with_tools.ainvoke(messages)
-        return {"messages": [response]}
+        prompt_messages = trim_messages_for_prompt(
+            messages,
+            max_history_messages=config.max_history_messages,
+        )
+        if not prompt_messages or not isinstance(prompt_messages[0], SystemMessage):
+            prompt_messages = [SystemMessage(content=system_prompt)] + prompt_messages
+        response = await llm_with_tools.ainvoke(prompt_messages)
+        trim_delta = build_trim_messages_delta(
+            messages,
+            max_history_messages=config.max_history_messages,
+        )
+        return {"messages": [*trim_delta, response]}
 
     tool_node = ToolNode(all_tools)
 
@@ -90,7 +135,7 @@ def build_graph(
         return END
 
     # ── 5. 构建状态图 ──
-    graph = StateGraph(state_class)
+    graph: Any = StateGraph(state_class)
     graph.add_node("agent", agent_node)
     graph.add_node("safe_tools", tool_node)
     graph.add_node("dangerous_tools", tool_node)

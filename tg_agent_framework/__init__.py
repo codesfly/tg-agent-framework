@@ -7,21 +7,28 @@ tg-agent-framework: Telegram + LangGraph Agent 快速开发框架
 3. 写 System Prompt
 """
 
-from tg_agent_framework.config import BaseConfig, SSHConfigMixin, load_base_config, persist_llm_settings
-from tg_agent_framework.state import AgentState
-from tg_agent_framework.graph import build_graph
-from tg_agent_framework.registry import ToolRegistry, ToolCategory, tool_registry
-from tg_agent_framework.events import EventBus
-from tg_agent_framework.memory.base import BaseMemory
-from tg_agent_framework.memory.null import NullMemory
-from tg_agent_framework.memory.checkpointer import PersistentMemorySaver
-from tg_agent_framework.memory.runtime_store import RuntimeStateStore
 from tg_agent_framework.bot.agent_bot import AgentBot
 from tg_agent_framework.bot.types import QuickAction
-from tg_agent_framework.tools.executor import CommandExecutor
-from tg_agent_framework.tools.tasks import BackgroundTaskManager
-from tg_agent_framework.tools.security import validate_shell_command, ALLOWED_SHELL_COMMANDS, BLOCKED_SHELL_PATTERNS
+from tg_agent_framework.config import (
+    BaseConfig,
+    SSHConfigMixin,
+    load_base_config,
+    persist_llm_settings,
+)
+from tg_agent_framework.events import EventBus
+from tg_agent_framework.graph import build_graph
+from tg_agent_framework.memory.base import BaseMemory
+from tg_agent_framework.memory.checkpointer import PersistentMemorySaver
+from tg_agent_framework.memory.null import NullMemory
+from tg_agent_framework.memory.runtime_store import RuntimeStateStore
+from tg_agent_framework.registry import ToolCategory, ToolRegistry, tool_registry
 from tg_agent_framework.scheduler import BaseScheduler
+from tg_agent_framework.state import AgentState
+from tg_agent_framework.tools.security import (
+    ALLOWED_SHELL_COMMANDS,
+    BLOCKED_SHELL_PATTERNS,
+    validate_shell_command,
+)
 
 __all__ = [
     # Config
@@ -47,8 +54,6 @@ __all__ = [
     "AgentBot",
     "QuickAction",
     # Tools
-    "CommandExecutor",
-    "BackgroundTaskManager",
     "validate_shell_command",
     "ALLOWED_SHELL_COMMANDS",
     "BLOCKED_SHELL_PATTERNS",

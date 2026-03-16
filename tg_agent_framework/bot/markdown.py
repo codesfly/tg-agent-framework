@@ -46,7 +46,7 @@ def markdown_to_telegram_html(text: str) -> str:
         code = match.group(2)
         safe_code = _html.escape(code)
         blocks.append(f"<pre><code>{safe_code}</code></pre>")
-        return f"___CODE_BLOCK_{len(blocks)-1}___"
+        return f"___CODE_BLOCK_{len(blocks) - 1}___"
 
     text = re.sub(r"```(\w*)\n(.*?)```", placeholder_code_block, text, flags=re.DOTALL)
 

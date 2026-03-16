@@ -98,10 +98,7 @@ class BaseScheduler:
             self._fail_counts[name] = 0
         else:
             self._fail_counts[name] = self._fail_counts.get(name, 0) + 1
-            if (
-                self._fail_counts[name] >= self._alert_threshold
-                and name not in self._alerted
-            ):
+            if self._fail_counts[name] >= self._alert_threshold and name not in self._alerted:
                 self._alerted.add(name)
                 await self._send_alert(name, msg)
                 if self._event_bus:
@@ -128,11 +125,7 @@ class BaseScheduler:
     async def _send_recovery(self, service: str, detail: str) -> None:
         now = datetime.now().strftime("%H:%M:%S")
         safe_detail = _html.escape(detail)
-        text = (
-            f"✅ <b>恢复: {_html.escape(service)} 已正常</b>\n\n"
-            f"时间: {now}\n"
-            f"状态: {safe_detail}"
-        )
+        text = f"✅ <b>恢复: {_html.escape(service)} 已正常</b>\n\n时间: {now}\n状态: {safe_detail}"
         for uid in self._config.telegram_allowed_users:
             try:
                 await self._bot_send(uid, text, parse_mode="HTML")

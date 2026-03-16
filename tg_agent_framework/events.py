@@ -43,9 +43,7 @@ class EventBus:
     def emit_fire_and_forget(self, event: str, **data: Any) -> None:
         """发布事件（不等待），适用于不需要等待结果的场景"""
         for handler in self._handlers.get(event, []):
-            asyncio.create_task(
-                self._safe_call(handler, event, data)
-            )
+            asyncio.create_task(self._safe_call(handler, event, data))
 
     async def _safe_call(self, handler: EventHandler, event: str, data: dict) -> None:
         try:

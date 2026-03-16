@@ -40,9 +40,11 @@ class ToolRegistry:
 
     def register(self, category: ToolCategory = ToolCategory.SAFE):
         """装饰器：注册工具到指定类别"""
+
         def decorator(tool_func):
             self._tools[category].append(tool_func)
             return tool_func
+
         return decorator
 
     def add(self, tool_func: Any, category: ToolCategory = ToolCategory.SAFE):

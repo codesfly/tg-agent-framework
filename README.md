@@ -27,7 +27,7 @@ python main.py
 | 🤖 LangGraph 编排 | 自动路由 LLM → 工具调用，支持安全/危险工具分离 |
 | 📱 Telegram Bot | 消息处理、进度追踪、Markdown→HTML、权限校验 |
 | ⚠️ 操作确认 | 危险工具自动暂停，等用户 Telegram 确认后执行 |
-| 💾 状态持久化 | SQLite 存储会话、任务状态，重启不丢失 |
+| 💾 状态持久化 | SQLite 存储会话与前台操作状态，重启不丢失 |
 | 🔧 声明式注册 | `@tool_registry.register()` 一行注册工具 |
 | 📡 事件总线 | `EventBus` 发布/订阅，解耦框架与业务 |
 | ⏰ 定时调度 | `BaseScheduler` 注册式健康检查 |
@@ -73,13 +73,23 @@ class MyBot(AgentBot):
 # 启动
 async def main():
     config = load_base_config(MyConfig)
-    store = RuntimeStateStore(config.state_dir)
+    store = RuntimeStateStore.from_config(config)
     store.init_schema()
-    graph, _ = build_graph(
-        config=config, state_store=store,
-        system_prompt="你是一个智能助手...",
+
+    def graph_factory(current_config: MyConfig, current_state_store: RuntimeStateStore):
+        return build_graph(
+            config=current_config,
+            state_store=current_state_store,
+            system_prompt="你是一个智能助手...",
+        )
+
+    graph, _ = graph_factory(config, store)
+    bot = MyBot(
+        config=config,
+        graph=graph,
+        state_store=store,
+        graph_factory=graph_factory,
     )
-    bot = MyBot(config=config, graph=graph, state_store=store)
     await bot.run()
 
 asyncio.run(main())

@@ -4,10 +4,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
 from collections import defaultdict
+from datetime import UTC, datetime
 from typing import Any, Sequence
 
 from langgraph.checkpoint.memory import InMemorySaver
@@ -17,6 +19,8 @@ from tg_agent_framework.memory.runtime_store import RuntimeStateStore
 logger = logging.getLogger(__name__)
 
 CHECKPOINTER_KEY = "graph_checkpointer_v2"
+CHECKPOINTER_FORMAT_VERSION = 1
+CHECKPOINTER_CORRUPT_PREFIX = f"{CHECKPOINTER_KEY}_corrupt_"
 
 
 class _CheckpointEncoder(json.JSONEncoder):
@@ -43,6 +47,7 @@ def _decode_hook(obj: dict) -> Any:
         return tuple(obj["data"])
     if obj.get("__datetime__"):
         from datetime import datetime
+
         try:
             return datetime.fromisoformat(obj["data"])
         except (ValueError, TypeError):
@@ -125,7 +130,13 @@ class PersistentMemorySaver(InMemorySaver):
                 },
                 "blobs": dict(self.blobs),
             }
-            serialized = json.dumps(payload, cls=_CheckpointEncoder).encode("utf-8")
+            payload_json = json.dumps(payload, cls=_CheckpointEncoder, sort_keys=True)
+            envelope = {
+                "format_version": CHECKPOINTER_FORMAT_VERSION,
+                "checksum": hashlib.sha256(payload_json.encode("utf-8")).hexdigest(),
+                "payload": payload,
+            }
+            serialized = json.dumps(envelope, cls=_CheckpointEncoder).encode("utf-8")
         except (TypeError, ValueError) as exc:
             logger.warning("Checkpointer 序列化失败，跳过持久化: %s", exc)
             return
@@ -137,9 +148,10 @@ class PersistentMemorySaver(InMemorySaver):
         if not raw:
             return
         try:
-            restored = json.loads(raw.decode("utf-8"), object_hook=_decode_hook)
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            logger.warning("Checkpointer 反序列化失败，将从空状态启动: %s", exc)
+            restored = self._decode_persisted_payload(raw)
+        except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+            logger.warning("Checkpointer 反序列化失败，已隔离损坏快照并从空状态启动: %s", exc)
+            self._quarantine_corrupt_payload(raw)
             return
         storage = defaultdict(lambda: defaultdict(dict))
         for thread_id, namespaces in restored.get("storage", {}).items():
@@ -157,3 +169,30 @@ class PersistentMemorySaver(InMemorySaver):
         self.storage = storage
         self.writes = writes
         self.blobs = restored.get("blobs", {})
+
+    def _decode_persisted_payload(self, raw: bytes) -> dict[str, Any]:
+        restored = json.loads(raw.decode("utf-8"), object_hook=_decode_hook)
+        if not isinstance(restored, dict):
+            raise ValueError("checkpoint payload 必须是对象")
+        if {"format_version", "checksum", "payload"} <= restored.keys():
+            if restored["format_version"] != CHECKPOINTER_FORMAT_VERSION:
+                raise ValueError(f"不支持的 checkpoint 版本: {restored['format_version']}")
+            payload = restored["payload"]
+            payload_json = json.dumps(payload, cls=_CheckpointEncoder, sort_keys=True)
+            checksum = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+            if checksum != restored["checksum"]:
+                raise ValueError("checkpoint checksum 校验失败")
+            if not isinstance(payload, dict):
+                raise ValueError("checkpoint payload 必须是对象")
+            return payload
+        return restored
+
+    def _quarantine_corrupt_payload(self, raw: bytes) -> None:
+        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        key = f"{CHECKPOINTER_CORRUPT_PREFIX}{timestamp}"
+        suffix = 0
+        while self._state_store.load_blob(key) is not None:
+            suffix += 1
+            key = f"{CHECKPOINTER_CORRUPT_PREFIX}{timestamp}_{suffix}"
+        self._state_store.save_blob(key, raw)
+        self._state_store.delete_blob(CHECKPOINTER_KEY)

@@ -17,20 +17,21 @@ AgentBot — Telegram + LangGraph Agent 通用 Bot 基类
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
-from datetime import datetime
 import html as _html
 import logging
 import time
 import uuid
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.types import BotCommand
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
-from tg_agent_framework.bot.auth import get_user_display, is_authorized
+from tg_agent_framework.bot.auth import is_authorized
 from tg_agent_framework.bot.keyboards import build_approval_keyboard, build_quick_action_keyboard
 from tg_agent_framework.bot.markdown import (
     markdown_to_telegram_html,
@@ -42,7 +43,15 @@ from tg_agent_framework.config import BaseConfig, persist_llm_settings
 from tg_agent_framework.events import EventBus, Events
 from tg_agent_framework.memory.base import BaseMemory
 from tg_agent_framework.memory.null import NullMemory
-from tg_agent_framework.memory.runtime_store import PersistedForegroundOperation, RuntimeStateStore
+from tg_agent_framework.memory.runtime_store import (
+    FOREGROUND_STATUS_AWAITING_APPROVAL,
+    FOREGROUND_STATUS_CANCELLING,
+    FOREGROUND_STATUS_INTERRUPTED,
+    FOREGROUND_STATUS_RUNNING,
+    FOREGROUND_STATUS_TIMED_OUT,
+    PersistedForegroundOperation,
+    RuntimeStateStore,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +66,7 @@ FOREGROUND_HEARTBEAT_SCHEDULE = (
 
 
 # ── 异常类 ──
+
 
 class ProgressInvocationError(Exception):
     def __init__(self, original: Exception, elapsed_seconds: float):
@@ -81,12 +91,15 @@ class ForegroundOperationTimedOut(Exception):
 @dataclass
 class ActiveForegroundOperation:
     user_id: int
+    thread_id: str
     action_label: str
     cancel_event: asyncio.Event
     cancel_reason: str | None = None
     chat_id: int = 0
     message_id: int = 0
     started_at: float = 0.0
+    started_at_iso: str = ""
+    status: str = FOREGROUND_STATUS_RUNNING
 
 
 class AgentBot:
@@ -103,24 +116,23 @@ class AgentBot:
         state_store: RuntimeStateStore,
         *,
         memory: BaseMemory | None = None,
-        task_manager: Any = None,
         event_bus: EventBus | None = None,
         dangerous_tool_names: set[str] | None = None,
+        graph_factory: Callable[[BaseConfig, RuntimeStateStore], Any] | None = None,
     ):
         self._config = config
         self._graph = graph
         self._state_store = state_store
         self._memory: BaseMemory = memory or NullMemory()
-        self._task_manager = task_manager
         self._event_bus = event_bus or EventBus()
         self._dangerous_tool_names = dangerous_tool_names or set()
+        self._graph_factory = graph_factory
 
         self._bot: Bot | None = None
         self._dp: Dispatcher | None = None
 
         # 运行时状态
         self._user_threads: dict[int, str] = {}
-        self._user_latest_task: dict[int, str] = {}
         self._active_foreground_ops: dict[int, ActiveForegroundOperation] = {}
 
     # ═══════════════════════════════════════════
@@ -129,14 +141,18 @@ class AgentBot:
 
     def get_start_message(self) -> str:
         """子类覆盖: /start 欢迎文案"""
-        return (
-            "🤖 **Agent 已就绪！**\n\n"
-            "你可以直接发送自然语言指令与我交互。\n\n"
-            "**内置命令：**\n"
-            "• `/reset` - 重置对话上下文\n"
-            "• `/stop` - 取消当前操作\n"
-            "• `/model` - 查看/切换 LLM 模型\n"
-        )
+        lines = [
+            "🤖 **Agent 已就绪！**",
+            "",
+            "你可以直接发送自然语言指令与我交互。",
+            "",
+            "**内置命令：**",
+            "• `/reset` - 重置对话上下文",
+            "• `/stop` - 取消当前操作",
+        ]
+        if self._graph_factory is not None:
+            lines.append("• `/model` - 查看/切换 LLM 模型")
+        return "\n".join(lines)
 
     def get_quick_actions(self) -> list[QuickAction]:
         """子类覆盖: 快捷操作面板按钮"""
@@ -144,12 +160,14 @@ class AgentBot:
 
     def get_bot_commands(self) -> list[BotCommand]:
         """子类覆盖: Bot 命令菜单"""
-        return [
+        commands = [
             BotCommand(command="start", description="启动对话"),
             BotCommand(command="reset", description="重置对话上下文"),
             BotCommand(command="stop", description="取消当前执行"),
-            BotCommand(command="model", description="查看/切换 LLM 模型"),
         ]
+        if self._graph_factory is not None:
+            commands.append(BotCommand(command="model", description="查看/切换 LLM 模型"))
+        return commands
 
     async def on_quick_action(self, action: str, callback: types.CallbackQuery) -> str | None:
         """
@@ -191,6 +209,8 @@ class AgentBot:
         operations = self._state_store.load_foreground_operations()
         for operation in operations:
             user_id = int(operation.user_id)
+            if operation.thread_id:
+                self._set_thread_id(user_id, f"tg-{user_id}-{uuid.uuid4().hex[:8]}")
             text = truncate_for_telegram(
                 self._build_completion_message(
                     action_label=operation.action_label,
@@ -229,17 +249,13 @@ class AgentBot:
         self._user_threads[user_id] = thread_id
         self._state_store.set_thread_id(user_id, thread_id)
 
-    def _get_latest_task_id(self, user_id: int) -> str | None:
-        if user_id in self._user_latest_task:
-            return self._user_latest_task[user_id]
-        task_id = self._state_store.get_latest_task(user_id)
-        if task_id:
-            self._user_latest_task[user_id] = task_id
-        return task_id
-
-    def _set_latest_task_id(self, user_id: int, task_id: str):
-        self._user_latest_task[user_id] = task_id
-        self._state_store.set_latest_task(user_id, task_id)
+    def _build_graph_for_current_config(self) -> Any:
+        if self._graph_factory is None:
+            raise RuntimeError("当前 Bot 未配置 graph_factory，无法在线切换模型")
+        rebuilt = self._graph_factory(self._config, self._state_store)
+        if isinstance(rebuilt, tuple):
+            return rebuilt[0]
+        return rebuilt
 
     # ═══════════════════════════════════════════
     #  内部: 前台操作管理
@@ -249,44 +265,90 @@ class AgentBot:
         return self._active_foreground_ops.get(user_id)
 
     def _register_active_foreground_operation(
-        self, user_id: int, action_label: str, chat_id: int, message_id: int,
+        self,
+        user_id: int,
+        thread_id: str,
+        action_label: str,
+        chat_id: int,
+        message_id: int,
     ) -> ActiveForegroundOperation:
         started_at = time.monotonic()
+        started_at_iso = datetime.now().isoformat(timespec="seconds")
         operation = ActiveForegroundOperation(
             user_id=user_id,
+            thread_id=thread_id,
             action_label=self._summarize_action_label(action_label),
             cancel_event=asyncio.Event(),
             chat_id=chat_id,
             message_id=message_id,
             started_at=started_at,
+            started_at_iso=started_at_iso,
         )
         self._active_foreground_ops[user_id] = operation
-        self._state_store.save_foreground_operation(
-            PersistedForegroundOperation(
-                user_id=str(user_id),
-                action_label=operation.action_label,
-                chat_id=chat_id,
-                message_id=message_id,
-                started_at=datetime.now().isoformat(timespec="seconds"),
-            )
-        )
+        self._persist_foreground_operation(operation)
         return operation
 
     def _clear_active_foreground_operation(
-        self, user_id: int, operation: ActiveForegroundOperation, *, clear_persisted_state: bool = True,
+        self,
+        user_id: int,
+        operation: ActiveForegroundOperation,
+        *,
+        clear_persisted_state: bool = True,
     ):
         if self._active_foreground_ops.get(user_id) is operation:
             self._active_foreground_ops.pop(user_id, None)
         if clear_persisted_state:
             self._state_store.delete_foreground_operation(user_id)
 
-    def _request_cancel_active_foreground(self, user_id: int, reason: str) -> ActiveForegroundOperation | None:
+    def _request_cancel_active_foreground(
+        self, user_id: int, reason: str
+    ) -> ActiveForegroundOperation | None:
         operation = self._active_foreground_ops.get(user_id)
         if not operation:
             return None
         operation.cancel_reason = reason
+        operation.status = FOREGROUND_STATUS_CANCELLING
+        self._persist_foreground_operation(operation)
         operation.cancel_event.set()
         return operation
+
+    def _persist_foreground_operation(self, operation: ActiveForegroundOperation) -> None:
+        self._state_store.save_foreground_operation(
+            PersistedForegroundOperation(
+                user_id=str(operation.user_id),
+                action_label=operation.action_label,
+                chat_id=operation.chat_id,
+                message_id=operation.message_id,
+                started_at=operation.started_at_iso,
+                thread_id=operation.thread_id,
+                status=operation.status,
+            )
+        )
+
+    def _persist_pending_approval(
+        self,
+        *,
+        user_id: int,
+        thread_id: str,
+        action_label: str,
+        chat_id: int,
+        message_id: int,
+    ) -> None:
+        self._state_store.save_foreground_operation(
+            PersistedForegroundOperation(
+                user_id=str(user_id),
+                action_label=self._summarize_action_label(action_label),
+                chat_id=chat_id,
+                message_id=message_id,
+                started_at=datetime.now().isoformat(timespec="seconds"),
+                thread_id=thread_id,
+                status=FOREGROUND_STATUS_AWAITING_APPROVAL,
+            )
+        )
+
+    def _thread_requires_dangerous_approval(self, thread_id: str) -> bool:
+        snapshot = self._graph.get_state(config={"configurable": {"thread_id": thread_id}})
+        return bool(snapshot.next and "dangerous_tools" in snapshot.next)
 
     def _foreground_operation_timeout_seconds(self) -> float:
         raw = getattr(self._config, "foreground_operation_timeout_seconds", 45.0)
@@ -327,7 +389,11 @@ class AgentBot:
         )
 
     def _build_completion_message(
-        self, action_label: str, response_text: str, elapsed_seconds: float, success: bool,
+        self,
+        action_label: str,
+        response_text: str,
+        elapsed_seconds: float,
+        success: bool,
     ) -> str:
         icon = "✅" if success else "❌"
         title = "操作完成" if success else "执行失败"
@@ -340,7 +406,10 @@ class AgentBot:
         )
 
     def _build_cancellation_message(
-        self, action_label: str, response_text: str, elapsed_seconds: float,
+        self,
+        action_label: str,
+        response_text: str,
+        elapsed_seconds: float,
     ) -> str:
         safe_action = _html.escape(self._summarize_action_label(action_label))
         body = markdown_to_telegram_html(response_text)
@@ -358,9 +427,30 @@ class AgentBot:
     def _extract_response(result: dict) -> str:
         messages = result.get("messages", [])
         for msg in reversed(messages):
-            if hasattr(msg, "content") and msg.content and not hasattr(msg, "tool_calls"):
-                return msg.content
+            if not isinstance(msg, AIMessage):
+                continue
+            if getattr(msg, "tool_calls", None):
+                continue
+            content = AgentBot._stringify_message_content(msg.content)
+            if content:
+                return content
         return "（Agent 无返回内容）"
+
+    @staticmethod
+    def _stringify_message_content(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict) and item.get("type") == "text":
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+            return "\n".join(part for part in parts if part)
+        return ""
 
     @staticmethod
     def _extract_pending_tools(result: dict) -> str:
@@ -372,30 +462,35 @@ class AgentBot:
                     name = tc.get("name", "unknown")
                     args = tc.get("args", {})
                     args_str = ", ".join(f"{k}={v!r}" for k, v in args.items())
-                    lines.append(f"🔧 <code>{_html.escape(name)}</code>({_html.escape(args_str[:200])})")
+                    lines.append(
+                        f"🔧 <code>{_html.escape(name)}</code>({_html.escape(args_str[:200])})"
+                    )
                 break
         return "\n".join(lines) if lines else "（未知操作）"
-
-    @staticmethod
-    def _extract_background_task_id(response_text: str) -> str | None:
-        import re
-        match = re.search(r"(task_[a-f0-9]+)", response_text)
-        return match.group(1) if match else None
 
     # ═══════════════════════════════════════════
     #  内部: 前台进度追踪
     # ═══════════════════════════════════════════
 
     async def _invoke_with_progress(
-        self, user_id: int, chat_id: int, message_id: int,
-        action_label: str, operation,
+        self,
+        user_id: int,
+        thread_id: str,
+        chat_id: int,
+        message_id: int,
+        action_label: str,
+        operation,
     ) -> tuple[Any, float]:
         """执行 LangGraph operation 并实时更新进度"""
         assert self._bot is not None
 
         operation_timeout = self._foreground_operation_timeout_seconds()
         active_operation = self._register_active_foreground_operation(
-            user_id, action_label, chat_id, message_id,
+            user_id,
+            thread_id,
+            action_label,
+            chat_id,
+            message_id,
         )
         stop_event = asyncio.Event()
         started_at = time.monotonic()
@@ -408,8 +503,10 @@ class AgentBot:
                 text = self._build_progress_message(action_label, elapsed)
                 try:
                     await self._bot.edit_message_text(
-                        chat_id=chat_id, message_id=message_id,
-                        text=text, parse_mode="HTML",
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=text,
+                        parse_mode="HTML",
                     )
                 except Exception:
                     pass
@@ -446,17 +543,24 @@ class AgentBot:
             if isinstance(exc, asyncio.TimeoutError):
                 logger.warning(
                     "前台操作超时 (user=%s, timeout=%ss)，自动重置对话上下文",
-                    user_id, operation_timeout,
+                    user_id,
+                    operation_timeout,
                 )
+                active_operation.status = FOREGROUND_STATUS_TIMED_OUT
+                self._persist_foreground_operation(active_operation)
                 self._set_thread_id(user_id, f"tg-{user_id}-{uuid.uuid4().hex[:8]}")
                 if self._event_bus:
                     self._event_bus.emit_fire_and_forget(
-                        Events.OPERATION_TIMEOUT, user_id=user_id, timeout=operation_timeout,
+                        Events.OPERATION_TIMEOUT,
+                        user_id=user_id,
+                        timeout=operation_timeout,
                     )
                 exc = ForegroundOperationTimedOut(operation_timeout)
             raise ProgressInvocationError(exc, time.monotonic() - started_at) from exc
         except asyncio.CancelledError:
             preserve_for_recovery = True
+            active_operation.status = FOREGROUND_STATUS_INTERRUPTED
+            self._persist_foreground_operation(active_operation)
             raise
         finally:
             stop_event.set()
@@ -464,7 +568,8 @@ class AgentBot:
             await asyncio.gather(cancel_task, return_exceptions=True)
             await asyncio.gather(heartbeat_task, return_exceptions=True)
             self._clear_active_foreground_operation(
-                user_id, active_operation,
+                user_id,
+                active_operation,
                 clear_persisted_state=not preserve_for_recovery,
             )
 
@@ -510,29 +615,11 @@ class AgentBot:
             if not is_authorized(message, self._config):
                 return
             user_id = message.from_user.id  # type: ignore[union-attr]
-            if not self._task_manager:
-                cancelled = self._request_cancel_active_foreground(user_id, "用户执行 /stop")
-                if cancelled:
-                    await message.reply("🛑 已请求取消当前前台操作")
-                else:
-                    await message.reply("当前没有正在执行的操作")
-                return
-            parts = message.text.split() if message.text else []
-            task_id = parts[1] if len(parts) > 1 else None
-            if not task_id:
-                cancelled = self._request_cancel_active_foreground(user_id, "用户执行 /stop")
-                if cancelled:
-                    await message.reply(f"🛑 已请求取消当前前台操作")
-                    return
-                task_id = self._get_latest_task_id(user_id)
-            if not task_id:
-                await message.reply("❓ 未指定任务 ID，且找不到你最近执行的后台任务。\n格式: `/stop task_xxxxxx`")
-                return
-            success = self._task_manager.stop_task(task_id)
-            if success:
-                await message.reply(f"🛑 已发起进程终止信号: `{task_id}`")
+            cancelled = self._request_cancel_active_foreground(user_id, "用户执行 /stop")
+            if cancelled:
+                await message.reply("🛑 已请求取消当前前台操作")
             else:
-                await message.reply(f"⚠️ 无法停止任务 `{task_id}`，可能已结束或不存在。")
+                await message.reply("当前没有正在执行的操作")
 
         @dp.message(Command("model"))
         async def handle_model(message: types.Message):
@@ -540,12 +627,20 @@ class AgentBot:
                 return
             parts = message.text.split(maxsplit=2) if message.text else []
             if len(parts) < 2:
+                switch_hint = (
+                    "切换: `/model <模型名> [API地址]`"
+                    if self._graph_factory is not None
+                    else "⚠️ 当前 Bot 未配置运行时图重建，不能在线切换模型"
+                )
                 await message.reply(
                     f"🧠 当前模型: `{self._config.llm_model}`\n"
                     f"🌐 API: `{self._config.llm_base_url}`\n\n"
-                    f"切换: `/model <模型名> [API地址]`",
+                    f"{switch_hint}",
                     parse_mode="Markdown",
                 )
+                return
+            if self._graph_factory is None:
+                await message.reply("⚠️ 当前 Bot 未配置 graph_factory，无法在线切换模型。")
                 return
             new_model = parts[1]
             new_base_url = parts[2] if len(parts) > 2 else self._config.llm_base_url
@@ -555,11 +650,7 @@ class AgentBot:
                 old_base_url = self._config.llm_base_url
                 self._config.llm_model = new_model
                 self._config.llm_base_url = new_base_url
-                from tg_agent_framework.graph import build_graph
-                new_graph, _ = build_graph(
-                    self._config, self._state_store,
-                    system_prompt="",  # 子类应重建整个 bot
-                )
+                new_graph = self._build_graph_for_current_config()
                 persist_llm_settings(self._config, new_model, new_base_url)
                 self._graph = new_graph
                 user_id = message.from_user.id  # type: ignore[union-attr]
@@ -600,8 +691,10 @@ class AgentBot:
                 return
             snapshot = self._graph.get_state(config={"configurable": {"thread_id": thread_id}})
             if snapshot.next:
-                if "dangerous_tools" in snapshot.next:
-                    await message.reply("⚠️ 上一个操作还在等待确认，请先点击【确定】或【取消】。若不可见，请 /reset。")
+                if self._thread_requires_dangerous_approval(thread_id):
+                    await message.reply(
+                        "⚠️ 上一个操作还在等待确认，请先点击【确定】或【取消】。若不可见，请 /reset。"
+                    )
                 else:
                     await message.reply("⚠️ Agent 状态异常，请发送 /reset 重置对话。")
                 return
@@ -610,6 +703,7 @@ class AgentBot:
             try:
                 result, elapsed = await self._invoke_with_progress(
                     user_id=user_id,
+                    thread_id=thread_id,
                     chat_id=message.chat.id,
                     message_id=thinking_msg.message_id,
                     action_label=action_label,
@@ -620,6 +714,13 @@ class AgentBot:
                 )
                 snapshot = self._graph.get_state(config={"configurable": {"thread_id": thread_id}})
                 if snapshot.next:
+                    self._persist_pending_approval(
+                        user_id=user_id,
+                        thread_id=thread_id,
+                        action_label=action_label,
+                        chat_id=message.chat.id,
+                        message_id=thinking_msg.message_id,
+                    )
                     pending_tools = self._extract_pending_tools(result)
                     await bot.edit_message_text(
                         chat_id=message.chat.id,
@@ -630,9 +731,6 @@ class AgentBot:
                     )
                 else:
                     response_text = self._extract_response(result)
-                    task_id = self._extract_background_task_id(response_text)
-                    if task_id:
-                        self._set_latest_task_id(user_id, task_id)
                     try:
                         safe_html = self._build_completion_message(
                             action_label=action_label,
@@ -651,12 +749,14 @@ class AgentBot:
                             chat_id=message.chat.id,
                             message_id=thinking_msg.message_id,
                             text=truncate_for_telegram(
-                                strip_html_tags(self._build_completion_message(
-                                    action_label=action_label,
-                                    response_text=response_text,
-                                    elapsed_seconds=elapsed,
-                                    success=True,
-                                ))
+                                strip_html_tags(
+                                    self._build_completion_message(
+                                        action_label=action_label,
+                                        response_text=response_text,
+                                        elapsed_seconds=elapsed,
+                                        success=True,
+                                    )
+                                )
                             ),
                         )
             except ProgressInvocationError as e:
@@ -704,20 +804,33 @@ class AgentBot:
             if initiator_id and str(user_id) != str(initiator_id):
                 await callback.answer("⛔ 只有操作发起者可以确认", show_alert=True)
                 return
+            if not self._thread_requires_dangerous_approval(thread_id):
+                self._state_store.delete_foreground_operation(user_id)
+                await callback.answer("当前没有待确认的危险操作", show_alert=True)
+                return
             await callback.answer("正在执行...")
             action_label = "确认危险操作"
             try:
                 result, elapsed = await self._invoke_with_progress(
                     user_id=user_id,
+                    thread_id=thread_id,
                     chat_id=callback.message.chat.id,
                     message_id=callback.message.message_id,
                     action_label=action_label,
                     operation=lambda: self._graph.ainvoke(
-                        None, config={"configurable": {"thread_id": thread_id}},
+                        None,
+                        config={"configurable": {"thread_id": thread_id}},
                     ),
                 )
                 snapshot = self._graph.get_state(config={"configurable": {"thread_id": thread_id}})
                 if snapshot.next and "dangerous_tools" in snapshot.next:
+                    self._persist_pending_approval(
+                        user_id=user_id,
+                        thread_id=thread_id,
+                        action_label=action_label,
+                        chat_id=callback.message.chat.id,
+                        message_id=callback.message.message_id,
+                    )
                     pending_tools = self._extract_pending_tools(result)
                     await bot.edit_message_text(
                         chat_id=callback.message.chat.id,
@@ -730,7 +843,7 @@ class AgentBot:
                 response_text = self._extract_response(result)
                 await self._memory.record_event(
                     event_type="tool_execution",
-                    description=f"用户确认执行危险操作",
+                    description="用户确认执行危险操作",
                     triggered_by=str(user_id),
                 )
                 safe_html = self._build_completion_message(
@@ -774,11 +887,16 @@ class AgentBot:
             if initiator_id and str(user_id) != str(initiator_id):
                 await callback.answer("⛔ 只有操作发起者可以取消", show_alert=True)
                 return
+            if not self._thread_requires_dangerous_approval(thread_id):
+                self._state_store.delete_foreground_operation(user_id)
+                await callback.answer("当前没有待取消的危险操作", show_alert=True)
+                return
             await callback.answer("已取消")
             config = {"configurable": {"thread_id": thread_id}}
             snapshot = self._graph.get_state(config)
             if snapshot.next:
                 self._set_thread_id(user_id, f"tg-{user_id}-{uuid.uuid4().hex[:8]}")
+            self._state_store.delete_foreground_operation(user_id)
             await bot.edit_message_text(
                 chat_id=callback.message.chat.id,
                 message_id=callback.message.message_id,
@@ -811,6 +929,7 @@ class AgentBot:
             try:
                 result, elapsed = await self._invoke_with_progress(
                     user_id=user_id,
+                    thread_id=thread_id,
                     chat_id=callback.message.chat.id,
                     message_id=thinking_msg.message_id,
                     action_label=user_text,
@@ -821,6 +940,13 @@ class AgentBot:
                 )
                 snapshot = self._graph.get_state(config={"configurable": {"thread_id": thread_id}})
                 if snapshot.next:
+                    self._persist_pending_approval(
+                        user_id=user_id,
+                        thread_id=thread_id,
+                        action_label=user_text,
+                        chat_id=callback.message.chat.id,
+                        message_id=thinking_msg.message_id,
+                    )
                     pending_tools = self._extract_pending_tools(result)
                     await bot.edit_message_text(
                         chat_id=callback.message.chat.id,

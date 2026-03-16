@@ -9,7 +9,6 @@ tg-agent init — 一键生成新 Agent 项目脚手架
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
 
@@ -17,7 +16,11 @@ from pathlib import Path
 #  项目模板
 # ═══════════════════════════════════════════
 
-PYPROJECT_TEMPLATE = '''[project]
+PYPROJECT_TEMPLATE = """[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
 name = "{slug}"
 version = "0.1.0"
 description = "{description}"
@@ -29,12 +32,30 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "ruff>=0.11",
+    "mypy>=1.10",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
 ]
-'''
 
-ENV_EXAMPLE_TEMPLATE = '''# === Telegram ===
+[tool.setuptools.packages.find]
+include = ["*"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_configs = true
+show_error_codes = true
+"""
+
+ENV_EXAMPLE_TEMPLATE = """# === Telegram ===
 TELEGRAM_BOT_TOKEN=your_token_here
 TELEGRAM_ALLOWED_USERS=123456789
 
@@ -43,13 +64,16 @@ LLM_API_KEY=your_api_key_here
 LLM_BASE_URL=https://api.openai.com/v1
 LLM_MODEL=gpt-4o
 
+# === 可选: 状态命名空间（同机多 Bot 时建议显式设置） ===
+# STATE_NAMESPACE=my-agent
+
 # === 可选: SSH 远程执行 ===
 # EXEC_MODE=remote
 # SSH_HOST=1.2.3.4
 # SSH_PORT=22
 # SSH_USER=root
 # SSH_KEY_PATH=~/.ssh/id_rsa
-'''
+"""
 
 CONFIG_TEMPLATE = '''"""
 {name} 配置
@@ -191,20 +215,24 @@ async def main():
             logger.error("配置错误: %s", err)
         sys.exit(1)
 
-    state_store = RuntimeStateStore(config.state_dir)
+    state_store = RuntimeStateStore.from_config(config)
     state_store.init_schema()
 
-    graph, _ = build_graph(
-        config=config,
-        state_store=state_store,
-        system_prompt=SYSTEM_PROMPT,
-    )
+    def graph_factory(current_config: AgentConfig, current_state_store: RuntimeStateStore):
+        return build_graph(
+            config=current_config,
+            state_store=current_state_store,
+            system_prompt=SYSTEM_PROMPT,
+        )
+
+    graph, _ = graph_factory(config, state_store)
 
     bot = MyBot(
         config=config,
         graph=graph,
         state_store=state_store,
         dangerous_tool_names=tool_registry.dangerous_tool_names,
+        graph_factory=graph_factory,
     )
 
     logger.info("🤖 {name} 启动中...")
@@ -215,7 +243,7 @@ if __name__ == "__main__":
     asyncio.run(main())
 '''
 
-AGENT_RULES_TEMPLATE = '''# {name} — AI 编码规则
+AGENT_RULES_TEMPLATE = """# {name} — AI 编码规则
 
 ## 项目结构
 
@@ -276,18 +304,18 @@ cp .env.example .env  # 填写你的密钥
 pip install -e .
 python main.py
 ```
-'''
+"""
 
-GITIGNORE_TEMPLATE = '''__pycache__/
+GITIGNORE_TEMPLATE = """__pycache__/
 *.pyc
 .env
 *.sqlite3
 .venv/
 dist/
 *.egg-info/
-'''
+"""
 
-README_TEMPLATE = '''# {name}
+README_TEMPLATE = """# {name}
 
 > 基于 [tg-agent-framework](https://github.com/your-org/tg-agent-framework) 构建
 
@@ -319,12 +347,13 @@ async def my_tool(param: str) -> str:
 | `main.py` | Bot 启动入口 |
 | `prompts.py` | Agent 人格定义 |
 | `tools/` | 工具函数 |
-'''
+"""
 
 
 # ═══════════════════════════════════════════
 #  脚手架逻辑
 # ═══════════════════════════════════════════
+
 
 def create_project(
     project_dir: str,

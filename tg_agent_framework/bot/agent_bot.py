@@ -197,6 +197,20 @@ class AgentBot:
         """
         return None
 
+    async def run_direct_message_action(
+        self,
+        text: str,
+        message: types.Message,
+    ) -> tuple[str, str, bool] | None:
+        """
+        子类可选覆盖: 对某些自然语言消息直接执行固定逻辑，绕开 LLM。
+
+        返回:
+        - `(action_label, response_text, success)` 表示已直接处理
+        - `None` 表示继续走默认的 LLM + LangGraph 流程
+        """
+        return None
+
     # ═══════════════════════════════════════════
     #  公共 API
     # ═══════════════════════════════════════════
@@ -744,11 +758,27 @@ class AgentBot:
                     chat_id=message.chat.id,
                     message_id=thinking_msg.message_id,
                     action_label=action_label,
-                    operation=lambda: self._graph.ainvoke(
-                        {"messages": [HumanMessage(content=message.text)]},
-                        config={"configurable": {"thread_id": thread_id}},
+                    operation=lambda: self._execute_message_operation(
+                        user_text=message.text,
+                        message=message,
+                        thread_id=thread_id,
                     ),
                 )
+                if isinstance(result, tuple) and len(result) == 3:
+                    direct_action_label, direct_response_text, direct_success = result
+                    safe_html = self._build_completion_message(
+                        action_label=direct_action_label,
+                        response_text=direct_response_text,
+                        elapsed_seconds=elapsed,
+                        success=direct_success,
+                    )
+                    await bot.edit_message_text(
+                        chat_id=message.chat.id,
+                        message_id=thinking_msg.message_id,
+                        text=truncate_for_telegram(safe_html),
+                        parse_mode="HTML",
+                    )
+                    return
                 snapshot = self._graph.get_state(config={"configurable": {"thread_id": thread_id}})
                 if snapshot.next:
                     self._persist_pending_approval(
@@ -1045,6 +1075,21 @@ class AgentBot:
                     ),
                     parse_mode="HTML",
                 )
+
+    async def _execute_message_operation(
+        self,
+        *,
+        user_text: str,
+        message: types.Message,
+        thread_id: str,
+    ) -> Any:
+        direct_result = await self.run_direct_message_action(user_text, message)
+        if direct_result is not None:
+            return direct_result
+        return await self._graph.ainvoke(
+            {"messages": [HumanMessage(content=user_text)]},
+            config={"configurable": {"thread_id": thread_id}},
+        )
 
     async def _execute_quick_action_operation(
         self,

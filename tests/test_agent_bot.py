@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
 import json
+import asyncio
+from types import SimpleNamespace
 
 from langchain_core.messages import AIMessage, HumanMessage
 
@@ -65,3 +67,53 @@ def test_describe_execution_error_highlights_json_decode_context():
     assert "gpt-test" in text
     assert "https://example.invalid/v1" in text
     assert "检查所有服务的运行状态" in text
+
+
+def test_execute_message_operation_uses_direct_hook_before_graph():
+    class DirectMessageBot(AgentBot):
+        async def run_direct_message_action(self, text, message):
+            return ("检查下服务状态", "direct ok", True)
+
+    class FailingGraph:
+        async def ainvoke(self, *_args, **_kwargs):
+            raise AssertionError("graph should not be called")
+
+    bot = DirectMessageBot(
+        config=type(
+            "Cfg",
+            (),
+            {
+                "telegram_bot_token": "x",
+                "telegram_allowed_users": [],
+                "llm_api_key": "sk-test",
+                "llm_base_url": "https://example.invalid/v1",
+                "llm_model": "gpt-test",
+                "llm_reasoning_effort": "",
+                "llm_request_timeout_seconds": 30.0,
+                "foreground_operation_timeout_seconds": 45.0,
+                "max_history_messages": 24,
+            },
+        )(),
+        graph=FailingGraph(),
+        state_store=type(
+            "StateStore",
+            (),
+            {
+                "get_thread_id": lambda self, user_id: None,
+                "set_thread_id": lambda self, user_id, thread_id: None,
+                "save_foreground_operation": lambda self, operation: None,
+                "delete_foreground_operation": lambda self, user_id: None,
+                "load_foreground_operations": lambda self: [],
+            },
+        )(),
+    )
+
+    result = asyncio.run(
+        bot._execute_message_operation(
+            user_text="检查下服务状态",
+            message=SimpleNamespace(text="检查下服务状态"),
+            thread_id="tg-42",
+        )
+    )
+
+    assert result == ("检查下服务状态", "direct ok", True)

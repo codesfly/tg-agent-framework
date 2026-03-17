@@ -8,7 +8,10 @@ LangGraph 主状态图 — 通用化编排
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
+import json
+import logging
 from typing import Any
 
 from langchain_core.messages import AnyMessage, SystemMessage
@@ -23,6 +26,9 @@ from tg_agent_framework.memory.checkpointer import PersistentMemorySaver
 from tg_agent_framework.memory.runtime_backend import RuntimeStateBackend
 from tg_agent_framework.registry import ToolRegistry, tool_registry
 from tg_agent_framework.state import AgentState
+
+logger = logging.getLogger(__name__)
+MALFORMED_LLM_RESPONSE_MAX_ATTEMPTS = 3
 
 
 def trim_messages_for_prompt(
@@ -57,6 +63,35 @@ def build_trim_messages_delta(
         if isinstance(message_id, str):
             delta.append(RemoveMessage(id=message_id))
     return delta
+
+
+async def _invoke_llm_with_retries(
+    llm_with_tools: Any,
+    prompt_messages: list[AnyMessage],
+    *,
+    max_attempts: int = MALFORMED_LLM_RESPONSE_MAX_ATTEMPTS,
+) -> Any:
+    attempts = max(1, max_attempts)
+    last_error: json.JSONDecodeError | None = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return await llm_with_tools.ainvoke(prompt_messages)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            if attempt >= attempts:
+                raise
+            logger.warning(
+                "LLM 返回了畸形 JSON，准备重试 (%s/%s): %s",
+                attempt,
+                attempts,
+                exc,
+            )
+            await asyncio.sleep(0)
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("LLM 调用失败，但未捕获具体异常")
 
 
 def build_graph(
@@ -115,7 +150,7 @@ def build_graph(
         )
         if not prompt_messages or not isinstance(prompt_messages[0], SystemMessage):
             prompt_messages = [SystemMessage(content=system_prompt)] + prompt_messages
-        response = await llm_with_tools.ainvoke(prompt_messages)
+        response = await _invoke_llm_with_retries(llm_with_tools, prompt_messages)
         trim_delta = build_trim_messages_delta(
             messages,
             max_history_messages=config.max_history_messages,

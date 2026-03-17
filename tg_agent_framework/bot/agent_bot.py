@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import html as _html
+import json
 import logging
 import time
 import uuid
@@ -181,6 +182,20 @@ class AgentBot:
             要发送给 Agent 的文本，或 None 跳过
         """
         return action
+
+    async def run_direct_quick_action(
+        self,
+        action: str,
+        callback: types.CallbackQuery,
+    ) -> tuple[str, str, bool] | None:
+        """
+        子类可选覆盖: 对某些快捷动作直接执行固定逻辑，绕开 LLM。
+
+        返回:
+        - `(action_label, response_text, success)` 表示已直接处理
+        - `None` 表示继续走默认的 LLM + LangGraph 流程
+        """
+        return None
 
     # ═══════════════════════════════════════════
     #  公共 API
@@ -418,6 +433,28 @@ class AgentBot:
             f"<b>请求:</b> <code>{safe_action}</code>\n\n"
             f"{body}"
         )
+
+    def _describe_execution_error(
+        self,
+        exc: Exception,
+        *,
+        action_label: str,
+        thread_id: str,
+    ) -> str:
+        if isinstance(exc, json.JSONDecodeError):
+            return (
+                "检测到 JSON 解析失败，这通常不是业务工具本身报错，而是上游模型/兼容接口返回了异常格式。\n\n"
+                f"线程: `{thread_id}`\n"
+                f"模型: `{self._config.llm_model}`\n"
+                f"接口: `{self._config.llm_base_url}`\n"
+                f"请求: `{self._summarize_action_label(action_label)}`\n\n"
+                "可能原因:\n"
+                "• 上游接口返回了空响应\n"
+                "• 工具调用参数返回了空字符串而不是 `{}`\n"
+                "• 返回内容不是合法 JSON，却被 SDK 当作 JSON 解析\n\n"
+                f"原始异常: `{type(exc).__name__}: {exc}`"
+            )
+        return f"Agent 执行出错: {type(exc).__name__}: {exc}"
 
     # ═══════════════════════════════════════════
     #  内部: LangGraph 响应提取
@@ -781,7 +818,11 @@ class AgentBot:
                     text=truncate_for_telegram(
                         self._build_completion_message(
                             action_label=action_label,
-                            response_text=f"Agent 执行出错: {e.original}",
+                            response_text=self._describe_execution_error(
+                                e.original,
+                                action_label=action_label,
+                                thread_id=thread_id,
+                            ),
                             elapsed_seconds=e.elapsed_seconds,
                             success=False,
                         )
@@ -933,11 +974,28 @@ class AgentBot:
                     chat_id=callback.message.chat.id,
                     message_id=thinking_msg.message_id,
                     action_label=user_text,
-                    operation=lambda: self._graph.ainvoke(
-                        {"messages": [HumanMessage(content=user_text)]},
-                        config={"configurable": {"thread_id": thread_id}},
+                    operation=lambda: self._execute_quick_action_operation(
+                        action=action,
+                        callback=callback,
+                        user_text=user_text,
+                        thread_id=thread_id,
                     ),
                 )
+                if isinstance(result, tuple) and len(result) == 3:
+                    direct_action_label, direct_response_text, direct_success = result
+                    safe_html = self._build_completion_message(
+                        action_label=direct_action_label,
+                        response_text=direct_response_text,
+                        elapsed_seconds=elapsed,
+                        success=direct_success,
+                    )
+                    await bot.edit_message_text(
+                        chat_id=callback.message.chat.id,
+                        message_id=thinking_msg.message_id,
+                        text=truncate_for_telegram(safe_html),
+                        parse_mode="HTML",
+                    )
+                    return
                 snapshot = self._graph.get_state(config={"configurable": {"thread_id": thread_id}})
                 if snapshot.next:
                     self._persist_pending_approval(
@@ -976,10 +1034,30 @@ class AgentBot:
                     text=truncate_for_telegram(
                         self._build_completion_message(
                             action_label=user_text,
-                            response_text=f"执行出错: {e.original}",
+                            response_text=self._describe_execution_error(
+                                e.original,
+                                action_label=user_text,
+                                thread_id=thread_id,
+                            ),
                             elapsed_seconds=e.elapsed_seconds,
                             success=False,
                         )
                     ),
                     parse_mode="HTML",
                 )
+
+    async def _execute_quick_action_operation(
+        self,
+        *,
+        action: str,
+        callback: types.CallbackQuery,
+        user_text: str,
+        thread_id: str,
+    ) -> Any:
+        direct_result = await self.run_direct_quick_action(action, callback)
+        if direct_result is not None:
+            return direct_result
+        return await self._graph.ainvoke(
+            {"messages": [HumanMessage(content=user_text)]},
+            config={"configurable": {"thread_id": thread_id}},
+        )

@@ -19,6 +19,8 @@ def truncate_for_telegram(text: str) -> str:
     """截断过长的消息，确保不超过 Telegram 限制"""
     if len(text) <= TG_MAX_LENGTH:
         return text
+    if re.search(r"<[^>]+>", text):
+        text = strip_html_tags(text)
     return text[: TG_MAX_LENGTH - 50] + "\n\n⚠️ 消息过长已截断..."
 
 

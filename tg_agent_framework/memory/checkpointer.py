@@ -56,26 +56,33 @@ def _decode_hook(obj: dict) -> Any:
 
 
 class PersistentMemorySaver(InMemorySaver):
-    """在 InMemorySaver 基础上，定期把状态快照写入本地 sqlite（使用 JSON 序列化）。"""
+    """在 InMemorySaver 基础上，定期把状态快照写入本地 sqlite（使用 JSON 序列化）。
+
+    写入采用防抖策略：多次快速 put() 只触发一次磁盘写入（延迟 2 秒合并）。
+    """
+
+    DEBOUNCE_SECONDS = 2.0
 
     def __init__(self, state_store: RuntimeStateBackend):
         super().__init__()
         self._state_store = state_store
         self._persist_lock = threading.Lock()
+        self._dirty = False
+        self._debounce_timer: threading.Timer | None = None
         self._restore()
 
     def put(self, config, checkpoint, metadata, new_versions):
         result = super().put(config, checkpoint, metadata, new_versions)
-        self._persist()
+        self._schedule_persist()
         return result
 
     def put_writes(self, config, writes, task_id, task_path=""):
         super().put_writes(config, writes, task_id, task_path)
-        self._persist()
+        self._schedule_persist()
 
     def delete_thread(self, thread_id: str) -> None:
         super().delete_thread(thread_id)
-        self._persist()
+        self._schedule_persist()
 
     def delete_for_runs(self, run_ids: Sequence[str]) -> None:
         targets = set(run_ids)
@@ -91,7 +98,7 @@ class PersistentMemorySaver(InMemorySaver):
                     del namespaces[checkpoint_ns]
             if not namespaces:
                 del self.storage[thread_id]
-        self._persist()
+        self._schedule_persist()
 
     def prune(self, thread_ids: Sequence[str], *, strategy: str = "keep_latest") -> None:
         if strategy not in {"keep_latest", "delete"}:
@@ -112,9 +119,34 @@ class PersistentMemorySaver(InMemorySaver):
                         continue
                     del checkpoints[checkpoint_id]
                     self.writes.pop((thread_id, checkpoint_ns, checkpoint_id), None)
-        self._persist()
+        self._schedule_persist()
 
-    def _persist(self):
+    def _schedule_persist(self):
+        """防抖写入：标记脏数据后延迟 2 秒合并写入。"""
+        self._dirty = True
+        with self._persist_lock:
+            if self._debounce_timer is not None:
+                self._debounce_timer.cancel()
+            self._debounce_timer = threading.Timer(
+                self.DEBOUNCE_SECONDS, self._do_persist
+            )
+            self._debounce_timer.daemon = True
+            self._debounce_timer.start()
+
+    def flush(self):
+        """立即将脏数据写入磁盘（用于优雅关闭）。"""
+        with self._persist_lock:
+            if self._debounce_timer is not None:
+                self._debounce_timer.cancel()
+                self._debounce_timer = None
+        if self._dirty:
+            self._do_persist()
+
+    def _do_persist(self):
+        """实际执行序列化 + 磁盘写入。"""
+        if not self._dirty:
+            return
+        self._dirty = False
         try:
             payload = {
                 "storage": {

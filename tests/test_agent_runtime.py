@@ -1,6 +1,9 @@
+import asyncio
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+
+from aiogram import Dispatcher
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -32,6 +35,16 @@ class FakeGraph:
 
     def get_state(self, config):
         return self._snapshot
+
+
+class RecordingGraph(FakeGraph):
+    def __init__(self):
+        super().__init__(())
+        self.calls: list[tuple[dict, dict]] = []
+
+    async def ainvoke(self, payload, config):
+        self.calls.append((payload, config))
+        return {"messages": []}
 
 
 def test_runtime_store_persists_foreground_operation_status_and_thread_id(tmp_path):
@@ -108,3 +121,56 @@ def test_dangerous_approval_guard_requires_pending_snapshot(tmp_path):
 
     bot._graph = FakeGraph(())
     assert bot._thread_requires_dangerous_approval("tg-42") is False
+
+
+def test_execute_message_operation_preprocesses_user_text_before_graph(tmp_path):
+    store = RuntimeStateStore(tmp_path / "state")
+    graph = RecordingGraph()
+
+    class PreprocessBot(AgentBot):
+        async def preprocess_user_text(self, text, *, thread_id, message=None, callback=None, action=None):
+            assert message.from_user.id == 42
+            assert callback is None
+            assert action is None
+            return f"{text}::{thread_id}::{message.from_user.id}"
+
+    bot = PreprocessBot(
+        config=BaseConfig(),
+        graph=graph,
+        state_store=store,
+    )
+
+    result = asyncio.run(
+        bot._execute_message_operation(
+            user_text="hello",
+            message=SimpleNamespace(from_user=SimpleNamespace(id=42)),
+            thread_id="tg-42",
+        )
+    )
+
+    assert result == {"messages": []}
+    assert graph.calls[0][0]["messages"][0].content == "hello::tg-42::42"
+
+
+def test_register_handlers_runs_additional_handler_hook(tmp_path):
+    store = RuntimeStateStore(tmp_path / "state")
+
+    class HookBot(AgentBot):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.hook_ran = False
+
+        def register_additional_handlers(self):
+            self.hook_ran = True
+
+    bot = HookBot(
+        config=BaseConfig(),
+        graph=FakeGraph(()),
+        state_store=store,
+    )
+    bot._dp = Dispatcher()
+    bot._bot = object()
+
+    bot._register_handlers()
+
+    assert bot.hook_ran is True

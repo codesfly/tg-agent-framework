@@ -211,6 +211,26 @@ class AgentBot:
         """
         return None
 
+    async def preprocess_user_text(
+        self,
+        text: str,
+        *,
+        thread_id: str,
+        message: types.Message | None = None,
+        callback: types.CallbackQuery | None = None,
+        action: str | None = None,
+    ) -> str:
+        """
+        子类可选覆盖: 在用户文本进入 LangGraph 前做预处理。
+
+        适用于注入上下文、归一化输入，或按消息/快捷操作来源补充信息。
+        """
+        return text
+
+    def register_additional_handlers(self) -> None:
+        """子类可选覆盖: 注册额外 Telegram handlers。"""
+        return None
+
     # ═══════════════════════════════════════════
     #  公共 API
     # ═══════════════════════════════════════════
@@ -1056,7 +1076,7 @@ class AgentBot:
                         message_id=thinking_msg.message_id,
                         text=truncate_for_telegram(safe_html),
                         parse_mode="HTML",
-                    )
+                )
             except ProgressInvocationError as e:
                 await bot.edit_message_text(
                     chat_id=callback.message.chat.id,
@@ -1076,6 +1096,8 @@ class AgentBot:
                     parse_mode="HTML",
                 )
 
+        self.register_additional_handlers()
+
     async def _execute_message_operation(
         self,
         *,
@@ -1086,8 +1108,13 @@ class AgentBot:
         direct_result = await self.run_direct_message_action(user_text, message)
         if direct_result is not None:
             return direct_result
+        prepared_text = await self.preprocess_user_text(
+            user_text,
+            thread_id=thread_id,
+            message=message,
+        )
         return await self._graph.ainvoke(
-            {"messages": [HumanMessage(content=user_text)]},
+            {"messages": [HumanMessage(content=prepared_text)]},
             config={"configurable": {"thread_id": thread_id}},
         )
 
@@ -1102,7 +1129,13 @@ class AgentBot:
         direct_result = await self.run_direct_quick_action(action, callback)
         if direct_result is not None:
             return direct_result
+        prepared_text = await self.preprocess_user_text(
+            user_text,
+            thread_id=thread_id,
+            callback=callback,
+            action=action,
+        )
         return await self._graph.ainvoke(
-            {"messages": [HumanMessage(content=user_text)]},
+            {"messages": [HumanMessage(content=prepared_text)]},
             config={"configurable": {"thread_id": thread_id}},
         )

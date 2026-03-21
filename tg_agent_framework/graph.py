@@ -31,12 +31,16 @@ logger = logging.getLogger(__name__)
 MALFORMED_LLM_RESPONSE_MAX_ATTEMPTS = 3
 
 
-def _sanitize_message_window(messages: list[AnyMessage]) -> list[AnyMessage]:
+def _sanitize_message_window(
+    messages: list[AnyMessage],
+    full_history: Sequence[AnyMessage] | None = None,
+) -> list[AnyMessage]:
     """确保 ToolMessage 总能找到对应的 AIMessage（含 tool_calls）。
 
-    如果窗口内存在孤立的 ToolMessage（其 tool_call_id 没有对应
-    AIMessage），则向前搜索并补入缺失的 AIMessage，避免 OpenAI 报
-    'No tool call found for function call output' 400 错误。
+    策略：
+    1. 优先从 full_history 中找回缺失的 AIMessage 并拼接到窗口前部
+    2. 如果找不到（full_history 为空或 AIMessage 已被 checkpoint 清理），
+       则移除孤立的 ToolMessage 作为 fallback
     """
     # 1. 收集窗口内 AIMessage 提供的所有 tool_call_id
     available_call_ids: set[str] = set()
@@ -58,29 +62,66 @@ def _sanitize_message_window(messages: list[AnyMessage]) -> list[AnyMessage]:
     if not orphan_call_ids:
         return messages  # 无孤立消息，直接返回
 
-    # 3. 从窗口中移除孤立的 ToolMessage（没有父 AIMessage）
-    sanitized = [
-        msg
-        for msg in messages
-        if not (
-            isinstance(msg, ToolMessage)
-            and getattr(msg, "tool_call_id", None) in orphan_call_ids
+    # 3. 尝试从完整历史中找回缺失的 AIMessage（拼接策略）
+    spliced_ai_messages: list[AnyMessage] = []
+    resolved_ids: set[str] = set()
+
+    if full_history:
+        # 构建 call_id → AIMessage 的索引
+        for msg in full_history:
+            if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+                msg_call_ids = {tc.get("id") for tc in msg.tool_calls if tc.get("id")}
+                matched = msg_call_ids & orphan_call_ids
+                if matched and msg not in messages:
+                    spliced_ai_messages.append(msg)
+                    resolved_ids |= matched
+
+    remaining_orphans = orphan_call_ids - resolved_ids
+
+    # 4. 拼接找回的 AIMessage 到窗口中（插入到第一个孤立 ToolMessage 之前）
+    if spliced_ai_messages:
+        # 找到第一个孤立 ToolMessage 的位置
+        insert_pos = 0
+        for i, msg in enumerate(messages):
+            if (
+                isinstance(msg, ToolMessage)
+                and getattr(msg, "tool_call_id", None) in resolved_ids
+            ):
+                insert_pos = i
+                break
+        result = messages[:insert_pos] + spliced_ai_messages + messages[insert_pos:]
+        logger.info(
+            "消息历史修复: 从完整历史中拼接回 %d 条 AIMessage (call_ids: %s)",
+            len(spliced_ai_messages),
+            resolved_ids,
         )
-    ]
-    removed_count = len(messages) - len(sanitized)
-    if removed_count:
+    else:
+        result = list(messages)
+
+    # 5. 对仍然无法解决的孤立 ToolMessage，fallback 移除
+    if remaining_orphans:
+        result = [
+            msg
+            for msg in result
+            if not (
+                isinstance(msg, ToolMessage)
+                and getattr(msg, "tool_call_id", None) in remaining_orphans
+            )
+        ]
         logger.warning(
-            "消息历史清理: 移除了 %d 条孤立 ToolMessage (call_ids: %s)",
-            removed_count,
-            orphan_call_ids,
+            "消息历史清理: 移除了 %d 条无法恢复的孤立 ToolMessage (call_ids: %s)",
+            len(remaining_orphans),
+            remaining_orphans,
         )
-    return sanitized
+
+    return result
 
 
 def trim_messages_for_prompt(
     messages: Sequence[AnyMessage],
     *,
     max_history_messages: int,
+    full_history: Sequence[AnyMessage] | None = None,
 ) -> list[AnyMessage]:
     if max_history_messages <= 0:
         return [message for message in messages if isinstance(message, SystemMessage)]
@@ -89,7 +130,7 @@ def trim_messages_for_prompt(
     if len(history_messages) <= max_history_messages:
         return list(messages)
     trimmed = system_messages + history_messages[-max_history_messages:]
-    return _sanitize_message_window(trimmed)
+    return _sanitize_message_window(trimmed, full_history=full_history)
 
 
 def build_trim_messages_delta(
@@ -129,6 +170,15 @@ def build_trim_messages_delta(
     return delta
 
 
+def _is_orphan_tool_message_error(exc: Exception) -> bool:
+    """检测是否为 OpenAI 'No tool call found for function call output' 400 错误。"""
+    error_text = str(exc).lower()
+    return (
+        "no tool call found" in error_text
+        or "function call output" in error_text
+    )
+
+
 async def _invoke_llm_with_retries(
     llm_with_tools: Any,
     prompt_messages: list[AnyMessage],
@@ -136,7 +186,7 @@ async def _invoke_llm_with_retries(
     max_attempts: int = MALFORMED_LLM_RESPONSE_MAX_ATTEMPTS,
 ) -> Any:
     attempts = max(1, max_attempts)
-    last_error: json.JSONDecodeError | None = None
+    last_error: Exception | None = None
 
     for attempt in range(1, attempts + 1):
         try:
@@ -152,6 +202,20 @@ async def _invoke_llm_with_retries(
                 exc,
             )
             await asyncio.sleep(0)
+        except Exception as exc:
+            # 捕获 OpenAI 400 孤立 ToolMessage 错误，清理后重试
+            if _is_orphan_tool_message_error(exc) and attempt < attempts:
+                logger.warning(
+                    "检测到孤立 ToolMessage 400 错误，清理消息后重试 (%s/%s): %s",
+                    attempt,
+                    attempts,
+                    exc,
+                )
+                prompt_messages = _sanitize_message_window(prompt_messages)
+                await asyncio.sleep(0)
+                last_error = exc
+                continue
+            raise
 
     if last_error is not None:
         raise last_error
@@ -211,6 +275,7 @@ def build_graph(
         prompt_messages = trim_messages_for_prompt(
             messages,
             max_history_messages=config.max_history_messages,
+            full_history=messages,  # 传入完整历史用于拼接
         )
         if not prompt_messages or not isinstance(prompt_messages[0], SystemMessage):
             prompt_messages = [SystemMessage(content=system_prompt)] + prompt_messages

@@ -67,12 +67,13 @@ def _sanitize_message_window(
     resolved_ids: set[str] = set()
 
     if full_history:
-        # 构建 call_id → AIMessage 的索引
+        # 用 id() 集合做 O(1) 查找，避免 O(n²)
+        window_ids = {id(m) for m in messages}
         for msg in full_history:
             if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
                 msg_call_ids = {tc.get("id") for tc in msg.tool_calls if tc.get("id")}
                 matched = msg_call_ids & orphan_call_ids
-                if matched and msg not in messages:
+                if matched and id(msg) not in window_ids:
                     spliced_ai_messages.append(msg)
                     resolved_ids |= matched
 
@@ -184,6 +185,7 @@ async def _invoke_llm_with_retries(
     prompt_messages: list[AnyMessage],
     *,
     max_attempts: int = MALFORMED_LLM_RESPONSE_MAX_ATTEMPTS,
+    full_history: Sequence[AnyMessage] | None = None,
 ) -> Any:
     attempts = max(1, max_attempts)
     last_error: Exception | None = None
@@ -211,7 +213,7 @@ async def _invoke_llm_with_retries(
                     attempts,
                     exc,
                 )
-                prompt_messages = _sanitize_message_window(prompt_messages)
+                prompt_messages = _sanitize_message_window(prompt_messages, full_history=full_history)
                 await asyncio.sleep(0)
                 last_error = exc
                 continue
@@ -279,7 +281,7 @@ def build_graph(
         )
         if not prompt_messages or not isinstance(prompt_messages[0], SystemMessage):
             prompt_messages = [SystemMessage(content=system_prompt)] + prompt_messages
-        response = await _invoke_llm_with_retries(llm_with_tools, prompt_messages)
+        response = await _invoke_llm_with_retries(llm_with_tools, prompt_messages, full_history=messages)
         trim_delta = build_trim_messages_delta(
             messages,
             max_history_messages=config.max_history_messages,

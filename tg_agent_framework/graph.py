@@ -14,7 +14,7 @@ import json
 import logging
 from typing import Any
 
-from langchain_core.messages import AnyMessage, SystemMessage
+from langchain_core.messages import AIMessage, AnyMessage, SystemMessage, ToolMessage
 from langchain_core.messages.modifier import RemoveMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
@@ -31,6 +31,52 @@ logger = logging.getLogger(__name__)
 MALFORMED_LLM_RESPONSE_MAX_ATTEMPTS = 3
 
 
+def _sanitize_message_window(messages: list[AnyMessage]) -> list[AnyMessage]:
+    """确保 ToolMessage 总能找到对应的 AIMessage（含 tool_calls）。
+
+    如果窗口内存在孤立的 ToolMessage（其 tool_call_id 没有对应
+    AIMessage），则向前搜索并补入缺失的 AIMessage，避免 OpenAI 报
+    'No tool call found for function call output' 400 错误。
+    """
+    # 1. 收集窗口内 AIMessage 提供的所有 tool_call_id
+    available_call_ids: set[str] = set()
+    for msg in messages:
+        if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+            for tc in msg.tool_calls:
+                call_id = tc.get("id")
+                if call_id:
+                    available_call_ids.add(call_id)
+
+    # 2. 查找孤立的 ToolMessage（call_id 不在窗口内）
+    orphan_call_ids: set[str] = set()
+    for msg in messages:
+        if isinstance(msg, ToolMessage):
+            call_id = getattr(msg, "tool_call_id", None)
+            if call_id and call_id not in available_call_ids:
+                orphan_call_ids.add(call_id)
+
+    if not orphan_call_ids:
+        return messages  # 无孤立消息，直接返回
+
+    # 3. 从窗口中移除孤立的 ToolMessage（没有父 AIMessage）
+    sanitized = [
+        msg
+        for msg in messages
+        if not (
+            isinstance(msg, ToolMessage)
+            and getattr(msg, "tool_call_id", None) in orphan_call_ids
+        )
+    ]
+    removed_count = len(messages) - len(sanitized)
+    if removed_count:
+        logger.warning(
+            "消息历史清理: 移除了 %d 条孤立 ToolMessage (call_ids: %s)",
+            removed_count,
+            orphan_call_ids,
+        )
+    return sanitized
+
+
 def trim_messages_for_prompt(
     messages: Sequence[AnyMessage],
     *,
@@ -42,7 +88,8 @@ def trim_messages_for_prompt(
     history_messages = [message for message in messages if not isinstance(message, SystemMessage)]
     if len(history_messages) <= max_history_messages:
         return list(messages)
-    return system_messages + history_messages[-max_history_messages:]
+    trimmed = system_messages + history_messages[-max_history_messages:]
+    return _sanitize_message_window(trimmed)
 
 
 def build_trim_messages_delta(
@@ -51,17 +98,34 @@ def build_trim_messages_delta(
     max_history_messages: int,
 ) -> list[RemoveMessage]:
     if max_history_messages <= 0:
-        removable = [message for message in messages if not isinstance(message, SystemMessage)]
+        removable_candidates = [message for message in messages if not isinstance(message, SystemMessage)]
     else:
         history_messages = [
             message for message in messages if not isinstance(message, SystemMessage)
         ]
-        removable = history_messages[:-max_history_messages]
+        removable_candidates = history_messages[:-max_history_messages]
+
+    # 收集要保留的消息中所有 ToolMessage 的 tool_call_id
+    kept_messages = [msg for msg in messages if msg not in removable_candidates]
+    needed_call_ids: set[str] = set()
+    for msg in kept_messages:
+        if isinstance(msg, ToolMessage):
+            call_id = getattr(msg, "tool_call_id", None)
+            if call_id:
+                needed_call_ids.add(call_id)
+
+    # 不要移除 AIMessage 如果其 tool_call_id 仍被保留区的 ToolMessage 引用
     delta: list[RemoveMessage] = []
-    for message in removable:
+    for message in removable_candidates:
         message_id = getattr(message, "id", None)
-        if isinstance(message_id, str):
-            delta.append(RemoveMessage(id=message_id))
+        if not isinstance(message_id, str):
+            continue
+        # 保护 AIMessage：如果其 tool_calls 的 id 仍被后续 ToolMessage 需要
+        if isinstance(message, AIMessage) and getattr(message, "tool_calls", None):
+            provided_ids = {tc.get("id") for tc in message.tool_calls if tc.get("id")}
+            if provided_ids & needed_call_ids:
+                continue  # 跳过，不删除此 AIMessage
+        delta.append(RemoveMessage(id=message_id))
     return delta
 
 

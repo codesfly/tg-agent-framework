@@ -60,7 +60,7 @@ def markdown_to_telegram_html(text: str) -> str:
     # 加粗
     text = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", text)
     # 斜体
-    text = re.sub(r"(?<!\*)\*(?!\*)([^*\n]+)(?<!\*)\*(?!\*)", r"<i>\1</i>", text)
+    text = re.sub(r"(?<!\*)\*(?!\*|\s)([^*\n]+?)(?<!\s)\*(?!\*)", r"<i>\1</i>", text)
     # 标题
     text = re.sub(r"^#{1,6}\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
 

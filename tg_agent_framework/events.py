@@ -21,6 +21,7 @@ class EventBus:
 
     def __init__(self):
         self._handlers: dict[str, list[EventHandler]] = defaultdict(list)
+        self._background_tasks: set[asyncio.Task] = set()
 
     def on(self, event: str, handler: EventHandler) -> None:
         """注册事件处理函数"""
@@ -43,7 +44,9 @@ class EventBus:
     def emit_fire_and_forget(self, event: str, **data: Any) -> None:
         """发布事件（不等待），适用于不需要等待结果的场景"""
         for handler in self._handlers.get(event, []):
-            asyncio.create_task(self._safe_call(handler, event, data))
+            task = asyncio.create_task(self._safe_call(handler, event, data))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
 
     async def _safe_call(self, handler: EventHandler, event: str, data: dict) -> None:
         try:

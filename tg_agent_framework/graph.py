@@ -162,8 +162,9 @@ def build_graph(
     # ── 4. 路由逻辑 ──
     def should_continue(state: dict) -> str:
         last_message = state["messages"][-1]
-        if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-            for tc in last_message.tool_calls:
+        tool_calls = getattr(last_message, "tool_calls", None)
+        if tool_calls:
+            for tc in tool_calls:
                 if tc["name"] in dangerous_names:
                     return "dangerous_tools"
             return "safe_tools"

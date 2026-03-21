@@ -16,6 +16,22 @@ if TYPE_CHECKING:
     from tg_agent_framework.bot.types import QuickAction
 
 
+# Telegram callback_data 最大 64 字节
+_CALLBACK_DATA_MAX_BYTES = 64
+
+
+def _safe_callback_data(prefix: str, thread_id: str, user_id: int) -> str:
+    """构建 callback_data 并确保不超过 64 字节限制"""
+    data = f"{prefix}:{thread_id}:{user_id}"
+    if len(data.encode("utf-8")) <= _CALLBACK_DATA_MAX_BYTES:
+        return data
+    # 截断 thread_id 以适应限制
+    overhead = len(f"{prefix}::{user_id}".encode("utf-8"))
+    max_tid_bytes = _CALLBACK_DATA_MAX_BYTES - overhead
+    truncated = thread_id.encode("utf-8")[:max_tid_bytes].decode("utf-8", errors="ignore")
+    return f"{prefix}:{truncated}:{user_id}"
+
+
 def build_approval_keyboard(thread_id: str, user_id: int) -> InlineKeyboardMarkup:
     """构建危险操作确认/拒绝键盘"""
     return InlineKeyboardMarkup(
@@ -23,11 +39,11 @@ def build_approval_keyboard(thread_id: str, user_id: int) -> InlineKeyboardMarku
             [
                 InlineKeyboardButton(
                     text="✅ 确定执行",
-                    callback_data=f"approve:{thread_id}:{user_id}",
+                    callback_data=_safe_callback_data("approve", thread_id, user_id),
                 ),
                 InlineKeyboardButton(
                     text="❌ 取消",
-                    callback_data=f"reject:{thread_id}:{user_id}",
+                    callback_data=_safe_callback_data("reject", thread_id, user_id),
                 ),
             ]
         ]

@@ -13,7 +13,15 @@ from tg_agent_framework.memory.types import MemoryRecord, MemoryScope
 class NullMemory(BaseMemory):
     """空实现，所有操作静默忽略"""
 
-    async def record_event(self, event_type: str, description: str, **kwargs) -> None:
+    async def record_event(
+        self,
+        event_type: str,
+        description: str,
+        *,
+        service: str = "",
+        triggered_by: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         pass
 
     async def get_recent_events(self, limit: int = 20) -> list[dict[str, Any]]:

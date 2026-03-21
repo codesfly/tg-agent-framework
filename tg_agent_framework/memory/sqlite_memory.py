@@ -4,6 +4,7 @@ SQLite 长期记忆实现。
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import sqlite3
@@ -49,53 +50,59 @@ class SqliteLongTermMemory(BaseMemory):
         )
 
     async def init_schema(self) -> None:
-        with self._lock:
-            self._state_dir.mkdir(parents=True, exist_ok=True)
-            with self._connect() as conn:
-                conn.executescript(SCHEMA_SQL)
-                conn.commit()
+        def _init():
+            with self._lock:
+                self._state_dir.mkdir(parents=True, exist_ok=True)
+                with self._connect() as conn:
+                    conn.executescript(SCHEMA_SQL)
+                    conn.commit()
+        await asyncio.to_thread(_init)
 
     async def upsert_memory(self, record: MemoryRecord) -> str:
         memory_id = record.memory_id or uuid.uuid4().hex
-        with self._lock:
-            with self._connect() as conn:
-                existing = conn.execute(
-                    """
-                    SELECT created_at
-                    FROM memories
-                    WHERE namespace = ? AND memory_id = ?
-                    """,
-                    (self._namespace, memory_id),
-                ).fetchone()
-                created_at = existing[0] if existing else record.created_at
-                conn.execute(
-                    """
-                    INSERT INTO memories (
-                        memory_id, namespace, scope_type, scope_id, kind, content,
-                        metadata_json, created_at, updated_at
+
+        def _upsert():
+            with self._lock:
+                with self._connect() as conn:
+                    existing = conn.execute(
+                        """
+                        SELECT created_at
+                        FROM memories
+                        WHERE namespace = ? AND memory_id = ?
+                        """,
+                        (self._namespace, memory_id),
+                    ).fetchone()
+                    created_at = existing[0] if existing else record.created_at
+                    conn.execute(
+                        """
+                        INSERT INTO memories (
+                            memory_id, namespace, scope_type, scope_id, kind, content,
+                            metadata_json, created_at, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(namespace, memory_id) DO UPDATE SET
+                            scope_type=excluded.scope_type,
+                            scope_id=excluded.scope_id,
+                            kind=excluded.kind,
+                            content=excluded.content,
+                            metadata_json=excluded.metadata_json,
+                            updated_at=excluded.updated_at
+                        """,
+                        (
+                            memory_id,
+                            self._namespace,
+                            record.scope.scope_type,
+                            record.scope.scope_id,
+                            record.kind,
+                            record.content,
+                            json.dumps(record.metadata, ensure_ascii=True, sort_keys=True),
+                            created_at,
+                            record.updated_at,
+                        ),
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(namespace, memory_id) DO UPDATE SET
-                        scope_type=excluded.scope_type,
-                        scope_id=excluded.scope_id,
-                        kind=excluded.kind,
-                        content=excluded.content,
-                        metadata_json=excluded.metadata_json,
-                        updated_at=excluded.updated_at
-                    """,
-                    (
-                        memory_id,
-                        self._namespace,
-                        record.scope.scope_type,
-                        record.scope.scope_id,
-                        record.kind,
-                        record.content,
-                        json.dumps(record.metadata, ensure_ascii=True, sort_keys=True),
-                        created_at,
-                        record.updated_at,
-                    ),
-                )
-                conn.commit()
+                    conn.commit()
+
+        await asyncio.to_thread(_upsert)
         return memory_id
 
     async def list_memories(
@@ -119,20 +126,26 @@ class SqliteLongTermMemory(BaseMemory):
         query.append("ORDER BY updated_at DESC, rowid DESC LIMIT ?")
         params.append(limit)
 
-        with self._lock:
-            with self._connect() as conn:
-                rows = conn.execute(" ".join(query), params).fetchall()
+        def _query():
+            with self._lock:
+                with self._connect() as conn:
+                    return conn.execute(" ".join(query), params).fetchall()
+
+        rows = await asyncio.to_thread(_query)
         return [self._row_to_record(row) for row in rows]
 
     async def delete_memory(self, memory_id: str) -> bool:
-        with self._lock:
-            with self._connect() as conn:
-                cursor = conn.execute(
-                    "DELETE FROM memories WHERE namespace = ? AND memory_id = ?",
-                    (self._namespace, memory_id),
-                )
-                conn.commit()
-        return cursor.rowcount > 0
+        def _delete():
+            with self._lock:
+                with self._connect() as conn:
+                    cursor = conn.execute(
+                        "DELETE FROM memories WHERE namespace = ? AND memory_id = ?",
+                        (self._namespace, memory_id),
+                    )
+                    conn.commit()
+                    return cursor.rowcount > 0
+
+        return await asyncio.to_thread(_delete)
 
     async def summarize_scope(self, scope: MemoryScope) -> str | None:
         summaries = await self.list_memories(scope, kind="summary", limit=1)

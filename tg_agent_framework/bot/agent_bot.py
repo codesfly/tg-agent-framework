@@ -271,6 +271,7 @@ class AgentBot:
                     success=False,
                 )
             )
+            notified = False
             try:
                 await self._bot.edit_message_text(
                     chat_id=operation.chat_id,
@@ -278,10 +279,17 @@ class AgentBot:
                     text=text,
                     parse_mode="HTML",
                 )
+                notified = True
             except Exception as exc:
-                logger.warning("恢复前台操作提示失败: %s", exc)
-            finally:
+                logger.warning("恢复前台操作提示失败 (user=%s): %s", user_id, exc)
+            if notified:
                 self._state_store.delete_foreground_operation(user_id)
+            else:
+                logger.warning(
+                    "保留中断记录 (user=%s)，因为无法通知用户。"
+                    "下次重启时将重新尝试恢复。",
+                    user_id,
+                )
 
     # ═══════════════════════════════════════════
     #  内部: Thread 管理
@@ -608,6 +616,12 @@ class AgentBot:
                 )
             result = await operation_task
             return result, time.monotonic() - started_at
+        except asyncio.CancelledError:
+            # CancelledError 继承 BaseException，必须在 Exception 之前捕获
+            preserve_for_recovery = True
+            active_operation.status = FOREGROUND_STATUS_INTERRUPTED
+            self._persist_foreground_operation(active_operation)
+            raise
         except Exception as exc:
             if isinstance(exc, ProgressInvocationError):
                 raise
@@ -628,11 +642,6 @@ class AgentBot:
                     )
                 exc = ForegroundOperationTimedOut(operation_timeout)
             raise ProgressInvocationError(exc, time.monotonic() - started_at) from exc
-        except asyncio.CancelledError:
-            preserve_for_recovery = True
-            active_operation.status = FOREGROUND_STATUS_INTERRUPTED
-            self._persist_foreground_operation(active_operation)
-            raise
         finally:
             stop_event.set()
             cancel_task.cancel()
@@ -716,9 +725,9 @@ class AgentBot:
             new_model = parts[1]
             new_base_url = parts[2] if len(parts) > 2 else self._config.llm_base_url
             thinking_msg = await message.reply("⏳ 正在切换模型...")
+            old_model = self._config.llm_model
+            old_base_url = self._config.llm_base_url
             try:
-                old_model = self._config.llm_model
-                old_base_url = self._config.llm_base_url
                 self._config.llm_model = new_model
                 self._config.llm_base_url = new_base_url
                 new_graph = self._build_graph_for_current_config()

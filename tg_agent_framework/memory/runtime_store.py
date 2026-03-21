@@ -10,7 +10,7 @@ import re
 import sqlite3
 import threading
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -260,6 +260,8 @@ class RuntimeStateStore:
         conn.commit()
 
     def _get_table_columns(self, conn: sqlite3.Connection, table: str) -> set[str]:
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", table):
+            raise ValueError(f"非法的表名: {table!r}")
         rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
         return {row[1] for row in rows}
 
@@ -294,6 +296,8 @@ class RuntimeStateStore:
         prefix = self._scope_prefix()
         return value[len(prefix) :] if value.startswith(prefix) else value
 
+    _SAFE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
     def _upsert(
         self,
         table: str,
@@ -302,6 +306,10 @@ class RuntimeStateStore:
         conflict_cols: tuple[str, ...],
         update_cols: tuple[str, ...],
     ):
+        # 防止 SQL 注入：校验表名和列名
+        for ident in (table, *columns, *conflict_cols, *update_cols):
+            if not self._SAFE_IDENT_RE.match(ident):
+                raise ValueError(f"非法的 SQL 标识符: {ident!r}")
         placeholders = ", ".join(["?"] * len(columns))
         assignments = ", ".join(f"{col}=excluded.{col}" for col in update_cols)
         with self._lock:
@@ -318,7 +326,7 @@ class RuntimeStateStore:
 
     @staticmethod
     def _now() -> str:
-        return datetime.now().isoformat(timespec="seconds")
+        return datetime.now(UTC).isoformat(timespec="seconds")
 
     @staticmethod
     def _normalize_namespace(value: str | None) -> str:

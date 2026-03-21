@@ -81,6 +81,9 @@ class BaseScheduler:
             try:
                 ok, msg = await fn()
                 await self._process_result(name, ok, msg)
+            except asyncio.CancelledError:
+                logger.info("健康检查 '%s' 已停止", name)
+                raise
             except Exception:
                 logger.exception("健康检查异常: %s", name)
             await asyncio.sleep(interval)
@@ -107,7 +110,7 @@ class BaseScheduler:
                     )
 
     async def _send_alert(self, service: str, detail: str) -> None:
-        now = datetime.now().strftime("%H:%M:%S")
+        now = datetime.now(tz=self._config_tz()).strftime("%H:%M:%S")
         safe_detail = _html.escape(detail)
         text = (
             f"🚨 <b>告警: {_html.escape(service)} 异常</b>\n\n"
@@ -123,7 +126,7 @@ class BaseScheduler:
                 logger.exception("发送告警到 %d 失败", uid)
 
     async def _send_recovery(self, service: str, detail: str) -> None:
-        now = datetime.now().strftime("%H:%M:%S")
+        now = datetime.now(tz=self._config_tz()).strftime("%H:%M:%S")
         safe_detail = _html.escape(detail)
         text = f"✅ <b>恢复: {_html.escape(service)} 已正常</b>\n\n时间: {now}\n状态: {safe_detail}"
         for uid in self._config.telegram_allowed_users:
@@ -131,3 +134,12 @@ class BaseScheduler:
                 await self._bot_send(uid, text, parse_mode="HTML")
             except Exception:
                 logger.exception("发送恢复通知到 %d 失败", uid)
+
+    @staticmethod
+    def _config_tz():
+        """返回调度器使用的时区，默认 UTC。"""
+        try:
+            from datetime import timezone
+            return timezone.utc
+        except ImportError:
+            return None

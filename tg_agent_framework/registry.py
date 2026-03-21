@@ -92,8 +92,10 @@ class ToolRegistry:
         ):
             try:
                 importlib.import_module(module_name)
+            except (ImportError, SyntaxError) as exc:
+                logger.warning("扫描模块失败: %s: %s", module_name, exc)
             except Exception:
-                logger.warning("扫描模块失败: %s", module_name, exc_info=True)
+                logger.warning("扫描模块异常: %s", module_name, exc_info=True)
 
     def clear(self):
         """清空所有注册（测试用）"""

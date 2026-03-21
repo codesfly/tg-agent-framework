@@ -107,7 +107,6 @@ BLOCKED_SHELL_PATTERNS: set[str] = {
     ";",
     "$(",
     "`",
-    "$(",
     "\n",
     "\\n",
     "rm ",

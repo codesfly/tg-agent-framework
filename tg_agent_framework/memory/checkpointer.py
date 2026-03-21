@@ -123,8 +123,8 @@ class PersistentMemorySaver(InMemorySaver):
 
     def _schedule_persist(self):
         """防抖写入：标记脏数据后延迟 2 秒合并写入。"""
-        self._dirty = True
         with self._persist_lock:
+            self._dirty = True
             if self._debounce_timer is not None:
                 self._debounce_timer.cancel()
             self._debounce_timer = threading.Timer(

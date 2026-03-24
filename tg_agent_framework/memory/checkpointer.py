@@ -23,6 +23,59 @@ CHECKPOINTER_FORMAT_VERSION = 1
 CHECKPOINTER_CORRUPT_PREFIX = f"{CHECKPOINTER_KEY}_corrupt_"
 
 
+def _json_safe_serialize(value: Any) -> Any:
+    if isinstance(value, dict):
+        if all(isinstance(key, str) for key in value):
+            return {key: _json_safe_serialize(item) for key, item in value.items()}
+        return {
+            "__mapping__": [
+                {
+                    "key": _json_safe_serialize(key),
+                    "value": _json_safe_serialize(item),
+                }
+                for key, item in value.items()
+            ]
+        }
+    if isinstance(value, tuple):
+        return {"__tuple__": True, "data": [_json_safe_serialize(item) for item in value]}
+    if isinstance(value, list):
+        return [_json_safe_serialize(item) for item in value]
+    if isinstance(value, bytes):
+        return {"__bytes__": True, "data": value.hex()}
+    if hasattr(value, "isoformat"):
+        return {"__datetime__": True, "data": value.isoformat()}
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        logger.debug("跳过不可序列化的对象: %s (类型: %s)", repr(value)[:100], type(value).__name__)
+        return {"__unserializable__": True, "type": type(value).__name__}
+
+
+def _json_safe_deserialize(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_json_safe_deserialize(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_json_safe_deserialize(item) for item in value)
+    if not isinstance(value, dict):
+        return value
+    if "__mapping__" in value:
+        return {
+            _json_safe_deserialize(item["key"]): _json_safe_deserialize(item["value"])
+            for item in value["__mapping__"]
+        }
+    if value.get("__bytes__"):
+        return bytes.fromhex(value["data"])
+    if value.get("__tuple__"):
+        return tuple(_json_safe_deserialize(item) for item in value["data"])
+    if value.get("__datetime__"):
+        try:
+            return datetime.fromisoformat(value["data"])
+        except (ValueError, TypeError):
+            return value["data"]
+    return {key: _json_safe_deserialize(item) for key, item in value.items()}
+
+
 class _CheckpointEncoder(json.JSONEncoder):
     """处理 LangGraph checkpoint 中的非标准 JSON 类型。"""
 
@@ -157,7 +210,9 @@ class PersistentMemorySaver(InMemorySaver):
                     for thread_id, namespaces in self.storage.items()
                 },
                 "writes": {
-                    json.dumps(key, cls=_CheckpointEncoder): dict(value)
+                    json.dumps(key, cls=_CheckpointEncoder): _json_safe_serialize(
+                        dict(value)
+                    )
                     for key, value in self.writes.items()
                 },
                 "blobs": dict(self.blobs),
@@ -194,30 +249,32 @@ class PersistentMemorySaver(InMemorySaver):
         writes = defaultdict(dict)
         for key_str, value in restored.get("writes", {}).items():
             try:
-                key = tuple(json.loads(key_str))
+                key = tuple(json.loads(key_str, object_hook=_decode_hook))
             except (json.JSONDecodeError, TypeError):
                 continue
-            writes[key] = dict(value)
+            decoded_value = _json_safe_deserialize(value)
+            if isinstance(decoded_value, dict):
+                writes[key] = dict(decoded_value)
         self.storage = storage
         self.writes = writes
         self.blobs = restored.get("blobs", {})
 
     def _decode_persisted_payload(self, raw: bytes) -> dict[str, Any]:
-        restored = json.loads(raw.decode("utf-8"), object_hook=_decode_hook)
+        restored = json.loads(raw.decode("utf-8"))
         if not isinstance(restored, dict):
             raise ValueError("checkpoint payload 必须是对象")
         if {"format_version", "checksum", "payload"} <= restored.keys():
             if restored["format_version"] != CHECKPOINTER_FORMAT_VERSION:
                 raise ValueError(f"不支持的 checkpoint 版本: {restored['format_version']}")
             payload = restored["payload"]
-            payload_json = json.dumps(payload, cls=_CheckpointEncoder, sort_keys=True)
+            payload_json = json.dumps(payload, sort_keys=True)
             checksum = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
             if checksum != restored["checksum"]:
                 raise ValueError("checkpoint checksum 校验失败")
             if not isinstance(payload, dict):
                 raise ValueError("checkpoint payload 必须是对象")
-            return payload
-        return restored
+            return _json_safe_deserialize(payload)
+        return _json_safe_deserialize(restored)
 
     def _quarantine_corrupt_payload(self, raw: bytes) -> None:
         timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")

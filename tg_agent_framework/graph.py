@@ -31,20 +31,40 @@ logger = logging.getLogger(__name__)
 MALFORMED_LLM_RESPONSE_MAX_ATTEMPTS = 3
 
 
+def _clone_ai_message_with_tool_calls(
+    message: AIMessage,
+    tool_calls: list[dict[str, Any]],
+) -> AIMessage:
+    if hasattr(message, "model_copy"):
+        return message.model_copy(update={"tool_calls": tool_calls})
+    return message.copy(deep=True, update={"tool_calls": tool_calls})
+
+
+def _message_has_content(message: AIMessage) -> bool:
+    content = getattr(message, "content", None)
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        return bool(content)
+    return bool(content)
+
+
 def _sanitize_message_window(
     messages: list[AnyMessage],
     full_history: Sequence[AnyMessage] | None = None,
 ) -> list[AnyMessage]:
-    """确保 ToolMessage 总能找到对应的 AIMessage（含 tool_calls）。
+    """确保 AIMessage.tool_calls 与 ToolMessage 输出始终成对出现。
 
     策略：
     1. 优先从 full_history 中找回缺失的 AIMessage 并拼接到窗口前部
-    2. 如果找不到（full_history 为空或 AIMessage 已被 checkpoint 清理），
-       则移除孤立的 ToolMessage 作为 fallback
+    2. 优先从 full_history 中找回缺失的 ToolMessage 并插回对应 AIMessage 后
+    3. 如果仍然无法恢复，则裁剪无效的 tool_call / ToolMessage 作为 fallback
     """
+    result = list(messages)
+
     # 1. 收集窗口内 AIMessage 提供的所有 tool_call_id
     available_call_ids: set[str] = set()
-    for msg in messages:
+    for msg in result:
         if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
             for tc in msg.tool_calls:
                 call_id = tc.get("id")
@@ -53,14 +73,14 @@ def _sanitize_message_window(
 
     # 2. 查找孤立的 ToolMessage（call_id 不在窗口内）
     orphan_call_ids: set[str] = set()
-    for msg in messages:
+    for msg in result:
         if isinstance(msg, ToolMessage):
             call_id = getattr(msg, "tool_call_id", None)
             if call_id and call_id not in available_call_ids:
                 orphan_call_ids.add(call_id)
 
     if not orphan_call_ids:
-        return messages  # 无孤立消息，直接返回
+        result = list(result)
 
     # 3. 尝试从完整历史中找回缺失的 AIMessage（拼接策略）
     spliced_ai_messages: list[AnyMessage] = []
@@ -68,7 +88,7 @@ def _sanitize_message_window(
 
     if full_history:
         # 用 id() 集合做 O(1) 查找，避免 O(n²)
-        window_ids = {id(m) for m in messages}
+        window_ids = {id(m) for m in result}
         for msg in full_history:
             if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
                 msg_call_ids = {tc.get("id") for tc in msg.tool_calls if tc.get("id")}
@@ -83,21 +103,19 @@ def _sanitize_message_window(
     if spliced_ai_messages:
         # 找到第一个孤立 ToolMessage 的位置
         insert_pos = 0
-        for i, msg in enumerate(messages):
+        for i, msg in enumerate(result):
             if (
                 isinstance(msg, ToolMessage)
                 and getattr(msg, "tool_call_id", None) in resolved_ids
             ):
                 insert_pos = i
                 break
-        result = messages[:insert_pos] + spliced_ai_messages + messages[insert_pos:]
+        result = result[:insert_pos] + spliced_ai_messages + result[insert_pos:]
         logger.info(
             "消息历史修复: 从完整历史中拼接回 %d 条 AIMessage (call_ids: %s)",
             len(spliced_ai_messages),
             resolved_ids,
         )
-    else:
-        result = list(messages)
 
     # 5. 对仍然无法解决的孤立 ToolMessage，fallback 移除
     if remaining_orphans:
@@ -114,6 +132,115 @@ def _sanitize_message_window(
             len(remaining_orphans),
             remaining_orphans,
         )
+
+    tool_output_ids = {
+        getattr(msg, "tool_call_id", None)
+        for msg in result
+        if isinstance(msg, ToolMessage) and getattr(msg, "tool_call_id", None)
+    }
+    missing_tool_output_ids: set[str] = set()
+    for msg in result:
+        if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+            for tc in msg.tool_calls:
+                call_id = tc.get("id")
+                if call_id and call_id not in tool_output_ids:
+                    missing_tool_output_ids.add(call_id)
+
+    recovered_tool_outputs: dict[str, list[ToolMessage]] = {}
+    if missing_tool_output_ids and full_history:
+        window_ids = {id(m) for m in result}
+        for msg in full_history:
+            if not isinstance(msg, ToolMessage):
+                continue
+            call_id = getattr(msg, "tool_call_id", None)
+            if (
+                call_id
+                and call_id in missing_tool_output_ids
+                and id(msg) not in window_ids
+            ):
+                recovered_tool_outputs.setdefault(call_id, []).append(msg)
+
+    if recovered_tool_outputs:
+        expanded_result: list[AnyMessage] = []
+        injected_call_ids: set[str] = set()
+        for msg in result:
+            expanded_result.append(msg)
+            if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+                for tc in msg.tool_calls:
+                    call_id = tc.get("id")
+                    if call_id and call_id in recovered_tool_outputs:
+                        expanded_result.extend(recovered_tool_outputs.pop(call_id))
+                        injected_call_ids.add(call_id)
+        for leftovers in recovered_tool_outputs.values():
+            expanded_result.extend(leftovers)
+        result = expanded_result
+        logger.info(
+            "消息历史修复: 从完整历史中补回 %d 条 ToolMessage (call_ids: %s)",
+            len(injected_call_ids),
+            injected_call_ids,
+        )
+
+    tool_output_ids = {
+        getattr(msg, "tool_call_id", None)
+        for msg in result
+        if isinstance(msg, ToolMessage) and getattr(msg, "tool_call_id", None)
+    }
+    pruned_call_ids: set[str] = set()
+    normalized_result: list[AnyMessage] = []
+    for msg in result:
+        if not isinstance(msg, AIMessage) or not getattr(msg, "tool_calls", None):
+            normalized_result.append(msg)
+            continue
+        kept_tool_calls = [
+            tc for tc in msg.tool_calls if tc.get("id") in tool_output_ids
+        ]
+        removed_ids = {
+            tc.get("id")
+            for tc in msg.tool_calls
+            if tc.get("id") and tc.get("id") not in tool_output_ids
+        }
+        pruned_call_ids |= removed_ids
+        if len(kept_tool_calls) == len(msg.tool_calls):
+            normalized_result.append(msg)
+            continue
+        if kept_tool_calls or _message_has_content(msg):
+            normalized_result.append(
+                _clone_ai_message_with_tool_calls(msg, kept_tool_calls)
+            )
+    result = normalized_result
+
+    if pruned_call_ids:
+        logger.warning(
+            "消息历史清理: 裁剪了 %d 个缺少 tool output 的 tool_call (call_ids: %s)",
+            len(pruned_call_ids),
+            pruned_call_ids,
+        )
+
+    available_call_ids = set()
+    for msg in result:
+        if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+            for tc in msg.tool_calls:
+                call_id = tc.get("id")
+                if call_id:
+                    available_call_ids.add(call_id)
+    dangling_tool_output_ids = {
+        getattr(msg, "tool_call_id", None)
+        for msg in result
+        if (
+            isinstance(msg, ToolMessage)
+            and getattr(msg, "tool_call_id", None)
+            and getattr(msg, "tool_call_id", None) not in available_call_ids
+        )
+    }
+    if dangling_tool_output_ids:
+        result = [
+            msg
+            for msg in result
+            if not (
+                isinstance(msg, ToolMessage)
+                and getattr(msg, "tool_call_id", None) in dangling_tool_output_ids
+            )
+        ]
 
     return result
 
@@ -147,36 +274,55 @@ def build_trim_messages_delta(
         ]
         removable_candidates = history_messages[:-max_history_messages]
 
-    # 收集要保留的消息中所有 ToolMessage 的 tool_call_id
     kept_messages = [msg for msg in messages if msg not in removable_candidates]
-    needed_call_ids: set[str] = set()
+    kept_tool_output_ids: set[str] = set()
     for msg in kept_messages:
         if isinstance(msg, ToolMessage):
             call_id = getattr(msg, "tool_call_id", None)
             if call_id:
-                needed_call_ids.add(call_id)
+                kept_tool_output_ids.add(call_id)
 
-    # 不要移除 AIMessage 如果其 tool_call_id 仍被保留区的 ToolMessage 引用
+    protected_ai_message_ids: set[str] = set()
+    required_call_ids: set[str] = set()
+    for msg in kept_messages:
+        if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+            required_call_ids.update(
+                tc.get("id") for tc in msg.tool_calls if tc.get("id")
+            )
+    for message in removable_candidates:
+        message_id = getattr(message, "id", None)
+        if not isinstance(message_id, str):
+            continue
+        if not isinstance(message, AIMessage) or not getattr(message, "tool_calls", None):
+            continue
+        provided_ids = {tc.get("id") for tc in message.tool_calls if tc.get("id")}
+        if provided_ids & kept_tool_output_ids:
+            protected_ai_message_ids.add(message_id)
+            required_call_ids.update(provided_ids)
+
     delta: list[RemoveMessage] = []
     for message in removable_candidates:
         message_id = getattr(message, "id", None)
         if not isinstance(message_id, str):
             continue
-        # 保护 AIMessage：如果其 tool_calls 的 id 仍被后续 ToolMessage 需要
         if isinstance(message, AIMessage) and getattr(message, "tool_calls", None):
-            provided_ids = {tc.get("id") for tc in message.tool_calls if tc.get("id")}
-            if provided_ids & needed_call_ids:
-                continue  # 跳过，不删除此 AIMessage
+            if message_id in protected_ai_message_ids:
+                continue
+        if isinstance(message, ToolMessage):
+            call_id = getattr(message, "tool_call_id", None)
+            if call_id and call_id in required_call_ids:
+                continue
         delta.append(RemoveMessage(id=message_id))
     return delta
 
 
 def _is_orphan_tool_message_error(exc: Exception) -> bool:
-    """检测是否为 OpenAI 'No tool call found for function call output' 400 错误。"""
+    """检测是否为 OpenAI 工具调用历史不一致导致的 400 错误。"""
     error_text = str(exc).lower()
     return (
         "no tool call found" in error_text
         or "function call output" in error_text
+        or "no tool output found" in error_text
     )
 
 

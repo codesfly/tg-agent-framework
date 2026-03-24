@@ -31,3 +31,22 @@ def test_corrupt_checkpoint_is_quarantined_on_restore(tmp_path):
     quarantined_keys = store.list_blob_keys(CHECKPOINTER_CORRUPT_PREFIX)
     assert len(quarantined_keys) == 1
     assert store.load_blob(quarantined_keys[0]) == b"{not-json"
+
+
+def test_checkpointer_persists_tuple_keys_inside_writes(tmp_path, caplog):
+    store = RuntimeStateStore(tmp_path / "state")
+    store.init_schema()
+    saver = PersistentMemorySaver(store)
+    saver.writes[("thread-1", "ns", "checkpoint-1")] = {
+        ("task-1", "path-1"): [("channel", {"value": "ok"})]
+    }
+
+    saver._dirty = True
+    saver._do_persist()
+
+    assert store.load_blob(CHECKPOINTER_KEY) is not None
+    assert "Checkpointer 序列化失败" not in caplog.text
+
+    restored = PersistentMemorySaver(store)
+    assert ("thread-1", "ns", "checkpoint-1") in restored.writes
+    assert ("task-1", "path-1") in restored.writes[("thread-1", "ns", "checkpoint-1")]
